@@ -408,10 +408,10 @@ if __name__ == "__main__":
     steps_all = {}
     agents_eval = {}
 
-    # Initialize step counters and expected return histories for agents
-    step_counter = {'Predicted': 0, 'Actual': 0}
-    expected_returns = {'Predicted': [], 'Actual': []}
-    steps = {'Predicted': [], 'Actual': []}
+    # # Initialize step counters and expected return histories for agents
+    # step_counter = {'Predicted': 0, 'Actual': 0}
+    # expected_returns = {'Predicted': [], 'Actual': []}
+    # steps = {'Predicted': [], 'Actual': []}
 
     segment_length = 50  # or any fixed length you prefer
 
@@ -429,13 +429,26 @@ if __name__ == "__main__":
         )
 
         # Initialize Agent and Optimizer
-        agent = Agent(envs).to(device)
-        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+        agent_predicted = Agent(envs).to(device)
+        optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
+
+        if cp == 0:
+            agent_actual = Agent(envs).to(device)
+            optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
 
         # Global step and start time
         global_step = 0
         start_time = time.time()
 
+        # Reset step counters and expected returns for agents
+        if cp == 0:
+            step_counter = {'Predicted': 0, 'Actual': 0}
+            expected_returns = {'Predicted': [], 'Actual': []}
+            steps = {'Predicted': [], 'Actual': []}
+        else:
+            step_counter = {'Predicted': 0}
+            expected_returns = {'Predicted': []}
+            steps = {'Predicted': []}
 
         for d in range(args.D):
             print(f"Outer iteration {d+1}/{args.D}")
@@ -444,7 +457,7 @@ if __name__ == "__main__":
             use_random_policy = (d == 0)  # Use random policy in the first iteration
             collector = TrajectoryCollector(
                 env_fn,
-                agent=agent if not use_random_policy else None,
+                agent=agent_predicted if not use_random_policy else None,
                 num_steps=segment_length,
                 device=device,
                 use_random_policy=use_random_policy,
@@ -463,36 +476,24 @@ if __name__ == "__main__":
             print("Training the Reward Predictor...")
             reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs)
 
-            # Save the agent at the end of iteration D-1
-            if d == args.D - 1:
-                agent_end_of_d_minus_one = copy.deepcopy(agent)
-                # Set up agents and optimizers for the last iteration
-                agent_predicted = agent_end_of_d_minus_one
-                optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
+            # agent_end_of_d_minus_one = copy.deepcopy(agent)
+            # agent_predicted = agent_end_of_d_minus_one
+            # optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
+            # if d == args.D - 1:
+            if cp == 0:
 
-                if cp == 0:
-                    agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
-                    optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
-                    agents = [('Predicted', agent_predicted, optimizer_predicted), ('Actual', agent_actual, optimizer_actual)]
-                else:
-                    agents = [('Predicted', agent_predicted, optimizer_predicted)]
+                
+                # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
+                # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
+                agents  = [('Predicted', agent_predicted, optimizer_predicted), ('Actual', agent_actual, optimizer_actual)]
+            else:
+                agents = [('Predicted', agent_predicted, optimizer_predicted)]
 
-                # Reset step counters and expected returns for agents
-                if cp == 0:
-                    step_counter = {'Predicted': 0, 'Actual': 0}
-                    expected_returns = {'Predicted': [], 'Actual': []}
-                    steps = {'Predicted': [], 'Actual': []}
-                else:
-                    step_counter = {'Predicted': 0}
-                    expected_returns = {'Predicted': []}
-                    steps = {'Predicted': []}
 
                 # Reset global_step and start_time
                 global_step = 0
                 start_time = time.time()
-            else:
-                # Continue training the agent using predicted rewards
-                agents = [('Predicted', agent, optimizer)]
+
 
             for agent_type, agent_instance, optimizer_instance in agents:
                 print(f"Training agent on {agent_type} rewards")
@@ -650,12 +651,12 @@ if __name__ == "__main__":
                     writer.add_scalar(f"charts/{agent_type}_cp{cp}_SPS", int(global_step / (time.time() - start_time)), global_step)
 
                     # Only track expected return during the last iteration (d = D - 1)
-                    if d == args.D - 1:
-                        avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
-                        expected_returns[agent_type].append(avg_return)
-                        steps[agent_type].append(step_counter[agent_type])
-                        print(f"Expected Return ({agent_type}, cp={cp}%): {avg_return}")
-                        writer.add_scalar(f"charts/{agent_type}_cp{cp}_expected_return", avg_return, step_counter[agent_type])
+                    # if d == args.D - 1:
+                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
+                    expected_returns[agent_type].append(avg_return)
+                    steps[agent_type].append(step_counter[agent_type])
+                    print(f"Expected Return ({agent_type}, cp={cp}%): {avg_return}")
+                    writer.add_scalar(f"charts/{agent_type}_cp{cp}_expected_return", avg_return, step_counter[agent_type])
 
         # Store results for plotting
         for agent_type in expected_returns.keys():
