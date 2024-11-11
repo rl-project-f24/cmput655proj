@@ -15,7 +15,7 @@ poetry install
 
 poetry shell # activate function
 
-python hello_world.py
+python project/PPO_mujoco.py
 ```
 
 
