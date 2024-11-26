@@ -22,8 +22,6 @@ import matplotlib.pyplot as plt
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
@@ -46,6 +44,8 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the id of the environment"""
+    num_seeds: int = 2
+    """number of seeds to run everythhing"""
     total_timesteps_per_iteration: int = 10000
     """total timesteps per outer loop iteration"""
     D: int = 5
@@ -415,14 +415,12 @@ if __name__ == "__main__":
 
     segment_length = 50  # or any fixed length you prefer
 
-    num_seeds = 3
+    num_seeds = args.num_seeds
     for seed in range(num_seeds):
         print(f"\n========= SEED: {seed} =========\n")
-        # TRY NOT TO MODIFY: seeding
-        args.seed = seed
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         torch.backends.cudnn.deterministic = args.torch_deterministic
 
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -526,7 +524,7 @@ if __name__ == "__main__":
                     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
                     # Initialize environment
-                    next_obs, _ = envs.reset(seed=args.seed)
+                    next_obs, _ = envs.reset(seed=seed)
                     next_obs = torch.Tensor(next_obs).to(device)
                     next_done = torch.zeros(args.num_envs).to(device)
 
