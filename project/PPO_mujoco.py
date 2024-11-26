@@ -80,13 +80,13 @@ class Args:
     """the target KL divergence threshold"""
 
     # Reward predictor specific arguments
-    reward_learning_rate: float = 1e-4
+    reward_learning_rate: float = 3e-5
     """learning rate for the reward predictor"""
     num_trajectories: int = 50
     """number of trajectories to collect for reward predictor training"""
     num_preferences: int = 1000
     """number of preference comparisons to generate"""
-    reward_training_epochs: int = 5
+    reward_training_epochs: int = 10
     """number of epochs to train the reward predictor"""
     corruption_percentage: float = 0.0
     """percentage of preference data to corrupt (e.g., 10.0 for 10%)"""
@@ -401,7 +401,7 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # Define corruption percentages
-    corruption_percentages = [0, 10, 20, 30]
+    corruption_percentages = [0, 15]
 
     # Initialize dictionaries to store results
     expected_returns_all = {}
@@ -548,13 +548,6 @@ if __name__ == "__main__":
                                 predicted_reward = reward_predictor(next_obs.unsqueeze(1)).squeeze(-1).squeeze(-1)
                             rewards[step] = predicted_reward
 
-                        if "final_info" in infos:
-                            for info in infos["final_info"]:
-                                if info and "episode" in info:
-                                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                                    writer.add_scalar(f"charts/{agent_type}_cp{cp}_episodic_return", info["episode"]["r"], global_step)
-                                    writer.add_scalar(f"charts/{agent_type}_cp{cp}_episodic_length", info["episode"]["l"], global_step)
-
                     # PPO Update code remains the same...
                     # bootstrap value if not done
                     with torch.no_grad():
@@ -638,24 +631,12 @@ if __name__ == "__main__":
                     var_y = np.var(y_true)
                     explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-                    # TRY NOT TO MODIFY: record losses for plotting purposes
-                    writer.add_scalar(f"charts/{agent_type}_cp{cp}_learning_rate", optimizer_instance.param_groups[0]["lr"], global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_value_loss", v_loss.item(), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_policy_loss", pg_loss.item(), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_entropy", entropy_loss.item(), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_old_approx_kl", old_approx_kl.item(), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_approx_kl", approx_kl.item(), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_clipfrac", np.mean(clipfracs), global_step)
-                    writer.add_scalar(f"losses/{agent_type}_cp{cp}_explained_variance", explained_var, global_step)
-                    print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent - SPS: {int(global_step / (time.time() - start_time))}")
-                    writer.add_scalar(f"charts/{agent_type}_cp{cp}_SPS", int(global_step / (time.time() - start_time)), global_step)
-
                     # Only track expected return during the last iteration (d = D - 1)
                     # if d == args.D - 1:
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
-                    print(f"Expected Return ({agent_type}, cp={cp}%): {avg_return}")
+                    print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} | Expected Return ({agent_type}, cp={cp}%): {avg_return}")
                     writer.add_scalar(f"charts/{agent_type}_cp{cp}_expected_return", avg_return, step_counter[agent_type])
 
         # Store results for plotting
