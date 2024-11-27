@@ -50,7 +50,7 @@ class Args:
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -72,7 +72,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.02
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -173,7 +173,7 @@ class RewardPredictorNetwork(nn.Module):
         batch_size, sequence_length, obs_dim = x.shape
         x = x.view(-1, obs_dim)  # Flatten to [batch_size * sequence_length, obs_dim]
         outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
-
+        # outputs = outputs_original
         outputs = self.sigmoid(outputs_original)
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
@@ -304,12 +304,12 @@ class RewardTrainer:
             reward_i = trajectories0[i][1]
             reward_j = trajectories1[i][1]
 
-            if reward_i - reward_j > 2:
-                pref = [1.0, 0]
-            elif reward_i - reward_j < -2:
-                pref = [0, 1.0]
+            if reward_i - reward_j > 0:
+                pref = [1.0, -1.0]
+            elif reward_i - reward_j < 0:
+                pref = [-1.0, 1.0]
             else:
-                pref = [0.5, 0.5]
+                pref = [0, 0]
 
             # Apply corruption
             if np.random.rand() < self.corruption_percentage:
@@ -401,7 +401,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
 
     # Define corruption percentages
-    corruption_percentages = [0, 15]
+    corruption_percentages = [0, 5, 15, 25, 50]
 
     # Initialize dictionaries to store results
     expected_returns_all = {}
