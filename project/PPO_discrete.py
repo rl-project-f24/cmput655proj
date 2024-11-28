@@ -107,6 +107,13 @@ class Args:
     total_timesteps: int = 0
     """the total timesteps (computed in runtime)"""
 
+    
+    run_evaluation: bool = False
+    """if toggled, will run the result evaluation including storing video"""
+
+
+
+
 
 
 def episode_trigger(episode_number):
@@ -692,7 +699,9 @@ if __name__ == "__main__":
                         # all_advantages[key].extend(normalized_b_adv)
                         print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent | Expected Return ({agent_type}, cp={cp}%): {avg_return=}")
                         log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
-                        evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
+                        if args.run_evaluation:
+                            if iteration == args.num_iterations_per_outer_loop:
+                                evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
 
             # Store results for plotting
             for agent_type in expected_returns.keys():
