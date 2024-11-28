@@ -16,6 +16,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.categorical import Categorical
 import matplotlib.pyplot as plt
 
+np.float_ = np.float64
+
 # from RL_classes import *
 
 @dataclass
@@ -44,13 +46,13 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the id of the environment"""
-    num_seeds: int = 2
+    num_seeds: int = 1
     """number of seeds to run everythhing"""
     total_timesteps_per_iteration: int = 10000
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-5
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -64,11 +66,11 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
     """the number of mini-batches"""
-    update_epochs: int = 5
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.02
+    clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
@@ -125,19 +127,20 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class AgentDiscrete(nn.Module):
     def __init__(self, envs):
         super().__init__()
+        hidden_size = 128
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(hidden_size, 1), std=1.0),
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            layer_init(nn.Linear(hidden_size, envs.single_action_space.n), std=0.01),
         )
 
     def get_value(self, x):
@@ -174,7 +177,7 @@ class RewardPredictorNetwork(nn.Module):
         x = x.view(-1, obs_dim)  # Flatten to [batch_size * sequence_length, obs_dim]
         outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
         # outputs = outputs_original
-        outputs = self.sigmoid(outputs_original)
+        outputs = -self.sigmoid(outputs_original)
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
         return outputs  # Shape: [batch_size, sequence_length, 1]
@@ -389,8 +392,19 @@ def expected_return(agent, env_fn, device, num_episodes=10, gamma=0.99):
 def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
 
+# Function to update running stats (mean and variance)
+def update_running_stats(rewards, running_mean, running_var, count, epsilon=1e-8):
+    new_count = count + len(rewards)
+    new_mean = (running_mean * count + rewards.sum()) / new_count
+    new_var = ((count * running_var) + ((rewards - running_mean) ** 2).sum()) / new_count
+    return new_mean, new_var, new_count
 
 if __name__ == "__main__":
+
+    # Initialize running statistics for reward normalization
+    running_mean_reward = 0.0
+    running_var_reward = 1.0
+    reward_count = 1
     
     args = tyro.cli(Args)
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
@@ -401,7 +415,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
 
     # Define corruption percentages
-    corruption_percentages = [0, 5, 15, 25, 50]
+    corruption_percentages = [0, 15]
 
     # Initialize dictionaries to store results
     expected_returns_all = {}
@@ -418,6 +432,7 @@ if __name__ == "__main__":
     num_seeds = args.num_seeds
     for seed in range(num_seeds):
         print(f"\n========= SEED: {seed} =========\n")
+        all_advantages = {}
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -502,6 +517,7 @@ if __name__ == "__main__":
                     
                     # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
                     # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
+                    # agents  = [('Actual', agent_actual, optimizer_actual)]
                     agents  = [('Predicted', agent_predicted, optimizer_predicted), ('Actual', agent_actual, optimizer_actual)]
                 else:
                     agents = [('Predicted', agent_predicted, optimizer_predicted)]
@@ -552,9 +568,14 @@ if __name__ == "__main__":
 
                             # TRY NOT TO MODIFY: execute the game and log data.
                             next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                            # if terminations[0]:
+                            #     print('HEREEEEEEEE', actual_reward)
                             next_obs = torch.Tensor(next_obs_np).to(device)
                             next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
                             actual_reward = torch.Tensor(actual_reward).to(device).view(-1)
+
+                            # running_mean_reward, running_var_reward, reward_count = update_running_stats(actual_reward, running_mean_reward, running_var_reward, reward_count)
+                            # normalized_rewards = (actual_reward - running_mean_reward) / (np.sqrt(running_var_reward) + 1e-8)
 
                             # Use Reward Predictor to estimate rewards or use actual rewards
                             if agent_type == 'Actual':
@@ -651,6 +672,11 @@ if __name__ == "__main__":
                         avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
                         expected_returns[agent_type].append(avg_return)
                         steps[agent_type].append(step_counter[agent_type])
+                        # key = f"{agent_type} cp={cp}%"
+                        # if key not in all_advantages:
+                        #     all_advantages[key] = []
+                        # normalized_b_adv = (b_advantages - torch.mean(b_advantages)) / max(torch.std(b_advantages), 1)
+                        # all_advantages[key].extend(normalized_b_adv)
                         print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent | Expected Return ({agent_type}, cp={cp}%): {avg_return}")
 
             # Store results for plotting
@@ -684,5 +710,14 @@ if __name__ == "__main__":
     plt.title(f'Expected Return Comparison: D={d}, env={args.env_id}, num_seeds={num_seeds}')
     plt.savefig(f"runs/{run_name}/expected_return_comparison_{args.env_id}.png")
     plt.show()
+
+    # plt.figure()
+    # for key in all_advantages:
+    #     plt.plot(all_advantages[key], label=key)
+    # plt.xlabel('Steps')
+    # plt.ylabel('Normalized Advantages')
+    # plt.legend()
+    # plt.title(f'Advantages Comparison: D={d}, env={args.env_id}, num_seeds={num_seeds}')
+    # plt.show()
 
     
