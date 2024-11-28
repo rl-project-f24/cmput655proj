@@ -444,7 +444,7 @@ if __name__ == "__main__":
         envs = gym.vector.SyncVectorEnv(
             [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
         )
-        env_fn = lambda: make_env(args.env_id, 0, args.capture_video, run_name)()
+        env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name)()
         assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
         for cp in corruption_percentages:
@@ -488,7 +488,7 @@ if __name__ == "__main__":
                 # Collect trajectories
                 use_random_policy = (d == 0)  # Use random policy in the first iteration
                 collector = TrajectoryCollector(
-                    env_fn,
+                    lambda: env_fn(),
                     agent=agent_predicted if not use_random_policy else None,
                     num_steps=segment_length,
                     device=device,
@@ -668,8 +668,11 @@ if __name__ == "__main__":
                         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
                         var_y = np.var(y_true)
                         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-                        avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
+                        capture_video = args.capture_video
+                        if args.capture_video:
+                            if seed == 0 and args.num_iterations_per_outer_loop - iteration < 3:
+                                capture_video = True
+                        avg_return = np.mean(expected_return(agent_instance, lambda: env_fn(capture_video), device, num_episodes=10, gamma=args.gamma))
                         expected_returns[agent_type].append(avg_return)
                         steps[agent_type].append(step_counter[agent_type])
                         # key = f"{agent_type} cp={cp}%"
