@@ -139,11 +139,11 @@ class Agent(nn.Module):
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 # Function to compute expected return
-def expected_return(agent, env_fn, device, num_episodes=10):
+def expected_return(agent, env_fn, device, seed, num_episodes=10):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
-        obs, _ = env.reset()
+        obs, _ = env.reset(seed=seed)
         done = False
         total_return = 0.0
         while not done:
@@ -252,7 +252,7 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # Compute expected return every iteration
-        avg_return = np.mean(expected_return(agent, env_fn, device, num_episodes=10))
+        avg_return = np.mean(expected_return(agent, env_fn, device, seed=args.seed, num_episodes=10))
         expected_returns.append(avg_return)
         steps.append(global_step)
         print(f"Iteration {iteration}/{args.num_iterations} | Expected Return: {avg_return}")

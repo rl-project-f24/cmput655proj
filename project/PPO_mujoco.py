@@ -57,7 +57,7 @@ class Args:
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 3e-5
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -79,7 +79,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.02
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -91,7 +91,7 @@ class Args:
     # Reward predictor specific arguments
     reward_learning_rate: float = 1e-4
     """learning rate for the reward predictor"""
-    num_trajectories: int = 100
+    num_trajectories: int = 50
     """number of trajectories to collect for reward predictor training"""
     num_preferences: int = 1000
     """number of preference comparisons to generate"""
@@ -140,7 +140,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        hidden_size = 128
+        hidden_size = 64
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
             nn.Tanh(),
@@ -383,11 +383,11 @@ class RewardTrainer:
             print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
 
 
-def expected_return(agent, env_fn, device, num_episodes=10, gamma=0.99):
+def expected_return(agent, env_fn, device, seed, num_episodes=10, gamma=0.99):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
-        obs, _ = env.reset()
+        obs, _ = env.reset(seed=seed)
         done = False
         total_return = 0.0
         # discount = 1.0
@@ -444,26 +444,17 @@ if __name__ == "__main__":
 
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-        # env setup
-        envs = gym.vector.SyncVectorEnv(
-            [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
-        )
-        env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name, args.gamma)()
-        assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-
-
         for cp in corruption_percentages:
             print(f"\n=== Processing Corruption Percentage: {cp}% ===\n")
             args.corruption_percentage = cp
 
-            # Initialize Reward Predictor and Trainer
-            reward_predictor = RewardPredictorNetwork(envs.single_observation_space)
-            reward_trainer = RewardTrainer(
-                reward_predictor,
-                device=device,
-                lr=args.reward_learning_rate,
-                corruption_percentage=args.corruption_percentage,
+            # env setup
+            envs = gym.vector.SyncVectorEnv(
+                [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
             )
+            env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name, args.gamma)()
+            assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+
 
             # Initialize Agent and Optimizer
             agent_predicted = Agent(envs).to(device)
@@ -472,6 +463,20 @@ if __name__ == "__main__":
             if cp == 0:
                 agent_actual = Agent(envs).to(device)
                 optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
+
+
+            # Initialize PPO storage variables and environment (move outside d loop)
+            obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+            actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+            logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+            rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+            dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+            values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+
+            # Initialize environment (move outside d loop)
+            next_obs, _ = envs.reset(seed=seed)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.zeros(args.num_envs).to(device)
 
             # Global step and start time
             global_step = 0
@@ -487,6 +492,14 @@ if __name__ == "__main__":
                 expected_returns = {'Predicted': []}
                 steps = {'Predicted': []}
 
+            # Initialize Reward Predictor and Trainer
+            reward_predictor = RewardPredictorNetwork(envs.single_observation_space)
+            reward_trainer = RewardTrainer(
+                reward_predictor,
+                device=device,
+                lr=args.reward_learning_rate,
+                corruption_percentage=args.corruption_percentage,
+            )
             for d in range(args.D):
                 print(f"Outer iteration {d+1}/{args.D}")
 
@@ -535,24 +548,14 @@ if __name__ == "__main__":
                 for agent_type, agent_instance, optimizer_instance in agents:
                     print(f"Training agent on {agent_type} rewards")
 
-                    # Initialize PPO storage variables
-                    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-                    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-                    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-                    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-                    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-                    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-
-                    # Initialize environment
-                    next_obs, _ = envs.reset(seed=seed)
-                    next_obs = torch.Tensor(next_obs).to(device)
-                    next_done = torch.zeros(args.num_envs).to(device)
-
                     # PPO Training loop
                     for iteration in range(1, args.num_iterations_per_outer_loop + 1):
+                        total_iterations = args.num_iterations_per_outer_loop * args.D
+                        current_iteration = iteration + d * args.num_iterations_per_outer_loop
                         # Annealing the rate if instructed to do so.
                         if args.anneal_lr:
-                            frac = 1.0 - (global_step - 1.0) / args.total_timesteps
+                        # Calculate total iterations and current iteration
+                            frac = 1.0 - (current_iteration - 1.0) / total_iterations
                             lrnow = frac * args.learning_rate
                             optimizer_instance.param_groups[0]["lr"] = lrnow
 
@@ -574,7 +577,7 @@ if __name__ == "__main__":
                             next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
                             next_obs = torch.Tensor(next_obs_np).to(device)
                             next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
-                            actual_reward = torch.Tensor(actual_reward).to(device).view(-1)
+                            actual_reward = torch.tensor(actual_reward).to(device).view(-1)
 
                             # Use Reward Predictor to estimate rewards or use actual rewards
                             if agent_type == 'Actual':
@@ -585,7 +588,16 @@ if __name__ == "__main__":
                                     predicted_reward = reward_predictor(next_obs.unsqueeze(1)).squeeze(-1).squeeze(-1)
                                 rewards[step] = predicted_reward
 
-                        # PPO Update code remains the same...
+
+                            # # If episode ends, reset the environment
+                            # for idx, done in enumerate(next_done):
+                            #     if done.item():
+                            #         obs[step + 1:, idx] = 0
+                            #         actions[step + 1:, idx] = 0
+                            #         logprobs[step + 1:, idx] = 0
+                            #         rewards[step + 1:, idx] = 0
+                            #         dones[step + 1:, idx] = 0
+                            #         values[step + 1:, idx] = 0
                         # bootstrap value if not done
                         with torch.no_grad():
                             next_value = agent_instance.get_value(next_obs).reshape(1, -1)
@@ -674,7 +686,7 @@ if __name__ == "__main__":
 
                         # Only track expected return during the last iteration (d = D - 1)
                         # if d == args.D - 1:
-                        avg_return = np.mean(expected_return(agent_instance, lambda: env_fn(capture_video), device, num_episodes=10, gamma=args.gamma))
+                        avg_return = np.mean(expected_return(agent_instance, lambda: env_fn(capture_video), device, seed=seed, num_episodes=10, gamma=args.gamma))
                         expected_returns[agent_type].append(avg_return)
                         steps[agent_type].append(step_counter[agent_type])
                         print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent | Expected Return ({agent_type}, cp={cp}%): {avg_return}")
