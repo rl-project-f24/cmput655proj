@@ -16,8 +16,8 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 # from sklearn.preprocessing import MinMaxScaler
 
-REWARD_MAX = 10.0
-REWARD_MIN = -10.0
+REWARD_MAX = 1
+REWARD_MIN = 0
 # min_max_scaler = MinMaxScaler(feature_range=(REWARD_MIN, REWARD_MAX))
 # fit the scaler to the range of rewards
 # min_max_scaler.fit(np.array([REWARD_MIN, REWARD_MAX]).reshape(-1, 1))
@@ -57,7 +57,7 @@ class Args:
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-5
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -79,7 +79,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.02
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -91,7 +91,7 @@ class Args:
     # Reward predictor specific arguments
     reward_learning_rate: float = 1e-4
     """learning rate for the reward predictor"""
-    num_trajectories: int = 50
+    num_trajectories: int = 150
     """number of trajectories to collect for reward predictor training"""
     num_preferences: int = 1000
     """number of preference comparisons to generate"""
@@ -123,7 +123,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, REWARD_MIN, REWARD_MAX))
         return env
@@ -140,13 +140,13 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        hidden_size = 64
+        hidden_size = 128
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(hidden_size, 1), std=1.0),
+            layer_init(nn.Linear(hidden_size, 1), std=0.1),
         )
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
@@ -535,7 +535,7 @@ if __name__ == "__main__":
                     
                     # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
                     # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
-                    agents  = [('Predicted', agent_predicted, optimizer_predicted), ('Actual', agent_actual, optimizer_actual)]
+                    agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
                 else:
                     agents = [('Predicted', agent_predicted, optimizer_predicted)]
 
