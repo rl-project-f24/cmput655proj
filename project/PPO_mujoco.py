@@ -14,6 +14,17 @@ from torch.distributions.normal import Normal
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+from torch.distributions.categorical import Categorical
+import matplotlib.pyplot as plt
+
+np.float_ = np.float64
+
+from project.evaluate_result import evaluate_result
+
+# from RL_classes import *
+
+
+
 # from sklearn.preprocessing import MinMaxScaler
 
 REWARD_MAX = 1
@@ -109,6 +120,22 @@ class Args:
     """the number of iterations per outer loop (computed in runtime)"""
     total_timesteps: int = 0
     """the total timesteps (computed in runtime)"""
+    
+    run_evaluation: bool = False
+    """if toggled, will run the result evaluation including storing video"""
+
+
+
+
+
+
+def episode_trigger(episode_number):
+    return False
+    # return episode_number % 10 == 0  # Record every 10th episode
+
+def step_trigger(step_number):
+    return False
+    # return step_number % 1000 == 0  # Record every 1000 steps   
 
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
@@ -129,7 +156,6 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         return env
 
     return thunk
-
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -407,9 +433,21 @@ def expected_return(agent, env_fn, device, seed, num_episodes=10, gamma=0.99):
 
 def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
-
+# Function to update running stats (mean and variance)
+def update_running_stats(rewards, running_mean, running_var, count, epsilon=1e-8):
+    new_count = count + len(rewards)
+    new_mean = (running_mean * count + rewards.sum()) / new_count
+    new_var = ((count * running_var) + ((rewards - running_mean) ** 2).sum()) / new_count
+    return new_mean, new_var, new_count
 
 if __name__ == "__main__":
+
+    # Initialize running statistics for reward normalization
+    running_mean_reward = 0.0
+    running_var_reward = 1.0
+    reward_count = 1
+
+    start_time = time.time()
     args = tyro.cli(Args)
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -679,17 +717,17 @@ if __name__ == "__main__":
                         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
                         var_y = np.var(y_true)
                         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-                        capture_video = args.capture_video
-                        if args.capture_video:
-                            if seed == 0 and args.num_iterations_per_outer_loop - iteration < 3:
-                                capture_video = True
 
                         # Only track expected return during the last iteration (d = D - 1)
                         # if d == args.D - 1:
-                        avg_return = np.mean(expected_return(agent_instance, lambda: env_fn(capture_video), device, seed=seed, num_episodes=10, gamma=args.gamma))
+                        avg_return = np.mean(expected_return(agent_instance, lambda: env_fn(args.capture_video), device, seed=seed, num_episodes=10, gamma=args.gamma))
                         expected_returns[agent_type].append(avg_return)
                         steps[agent_type].append(step_counter[agent_type])
-                        print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent | Expected Return ({agent_type}, cp={cp}%): {avg_return}")
+                        print(f"Iteration {iteration}/{args.num_iterations_per_outer_loop} - {agent_type} Agent | Expected Return ({agent_type}, cp={cp}%): {avg_return=}")
+                        log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
+                        if args.run_evaluation:
+                            if iteration == args.num_iterations_per_outer_loop:
+                                evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
 
             # Store results for plotting
             for agent_type in expected_returns.keys():
@@ -707,6 +745,9 @@ if __name__ == "__main__":
                     agents_eval[key] = copy.deepcopy(agent_actual)
 
         envs.close()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Execution time: {elapsed_time:.4f} seconds")
     # Plotting the expected return comparison
     plt.figure()
     # steps_all = np.asarray(steps_all)
