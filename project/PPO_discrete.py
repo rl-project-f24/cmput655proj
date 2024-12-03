@@ -416,6 +416,7 @@ def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
 
 def run_subprocess(seed, run_name, args):
+    eval_flag = args.run_evaluation and seed == evaluation_seed # only evaluate if the seed is the evaluation one
     start_time = time.time()
     print(f"SEED: {seed} STARTING!!!!!")
     random.seed(seed)
@@ -663,7 +664,7 @@ def run_subprocess(seed, run_name, args):
                     steps[agent_type].append(step_counter[agent_type])
                     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
-                    if args.run_evaluation:
+                    if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
         
@@ -700,6 +701,9 @@ if __name__ == "__main__":
 
     num_seeds = args.num_seeds
     seeds = list(range(num_seeds))
+    # Define the seed for evaluation
+    evaluation_seed = seeds[0]  # Select the first seed for evaluation
+
 
     run_subprocess_partial = partial(
         run_subprocess,
@@ -708,6 +712,7 @@ if __name__ == "__main__":
     )
 
     num_processes = multiprocessing.cpu_count()
+    num_processes = 10
 
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = pool.map(run_subprocess_partial, seeds)
