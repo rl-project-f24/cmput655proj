@@ -175,7 +175,7 @@ class AgentDiscrete(nn.Module):
 
 # Reward Predictor Network
 class RewardPredictorNetwork(nn.Module):
-    def __init__(self, observation_space):
+    def __init__(self, observation_space, env_id):
         super().__init__()
         input_dim = np.prod(observation_space.shape)
         hidden_size = 256
@@ -189,6 +189,7 @@ class RewardPredictorNetwork(nn.Module):
             layer_init(nn.Linear(hidden_size, 1)),
         )
         self.sigmoid = nn.Sigmoid()
+        self.env_id = env_id
 
     def forward(self, x):
         # x shape: [batch_size, sequence_length, observation_dim]
@@ -196,7 +197,10 @@ class RewardPredictorNetwork(nn.Module):
         x = x.view(-1, obs_dim)  # Flatten to [batch_size * sequence_length, obs_dim]
         outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
         # outputs = outputs_original
-        outputs = self.sigmoid(outputs_original)
+        if self.env_id == "Acrobot-v1":
+            outputs = -self.sigmoid(outputs_original)
+        else:
+            outputs = self.sigmoid(outputs_original)
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
         return outputs  # Shape: [batch_size, sequence_length, 1]
@@ -386,11 +390,11 @@ class RewardTrainer:
             print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
 
 
-def expected_return(agent, env_fn, device, num_episodes=10, gamma=0.99):
+def expected_return(agent, env_fn, device, seed, num_episodes=10, gamma=0.99):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
-        obs, _ = env.reset()
+        obs, _ = env.reset(seed=seed)
         done = False
         total_return = 0.0
         # discount = 1.0
@@ -434,14 +438,14 @@ def run_subprocess(seed, run_name, args):
     segment_length = 50  # or any fixed length you prefer
 
     # Define corruption percentages
-    corruption_percentages = [0, 15]
+    corruption_percentages = [0, 15, 50]
 
     for cp in corruption_percentages:
         print(f"Seed: {seed} | Processing Corruption Percentage: {cp}%")
         args.corruption_percentage = cp
 
         # Initialize Reward Predictor and Trainer
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space)
+        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, args.env_id)
         reward_trainer = RewardTrainer(
             reward_predictor,
             device=device,
@@ -469,6 +473,11 @@ def run_subprocess(seed, run_name, args):
             step_counter = {'Predicted': 0}
             expected_returns = {'Predicted': []}
             steps = {'Predicted': []}
+            
+        # for actual agent
+        next_obs, _ = envs.reset(seed=seed)
+        next_obs = torch.Tensor(next_obs).to(device)
+        next_done = torch.zeros(args.num_envs).to(device)
 
         for d in range(args.D):
             print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
@@ -522,15 +531,18 @@ def run_subprocess(seed, run_name, args):
                 values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
                 # Initialize environment
-                next_obs, _ = envs.reset(seed=seed)
-                next_obs = torch.Tensor(next_obs).to(device)
-                next_done = torch.zeros(args.num_envs).to(device)
+                if agent_type != 'Actual':
+                    next_obs, _ = envs.reset(seed=seed)
+                    next_obs = torch.Tensor(next_obs).to(device)
+                    next_done = torch.zeros(args.num_envs).to(device)
 
                 # PPO Training loop
                 for iteration in range(1, args.num_iterations_per_outer_loop + 1):
+                    total_iterations = args.num_iterations_per_outer_loop * args.D
+                    current_iteration = iteration + d * args.num_iterations_per_outer_loop
                     # Annealing the rate if instructed to do so.
                     if args.anneal_lr:
-                        frac = 1.0 - (global_step - 1.0) / args.total_timesteps
+                        frac = 1.0 - (current_iteration - 1.0) / total_iterations
                         lrnow = frac * args.learning_rate
                         optimizer_instance.param_groups[0]["lr"] = lrnow
 
@@ -646,7 +658,7 @@ def run_subprocess(seed, run_name, args):
                     var_y = np.var(y_true)
                     explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, num_episodes=10, gamma=args.gamma))
+                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, num_episodes=10, gamma=args.gamma))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
                     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")

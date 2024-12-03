@@ -457,7 +457,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
 
     # Define corruption percentages
-    corruption_percentages = [0, 15]
+    corruption_percentages = [0, 15, 50]
 
     # Initialize dictionaries to store results
     expected_returns_all = {}
@@ -538,6 +538,11 @@ if __name__ == "__main__":
                 lr=args.reward_learning_rate,
                 corruption_percentage=args.corruption_percentage,
             )
+            # for actual agent
+            next_obs, _ = envs.reset(seed=seed)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.zeros(args.num_envs).to(device)
+
             for d in range(args.D):
                 print(f"Outer iteration {d+1}/{args.D}")
 
@@ -585,6 +590,10 @@ if __name__ == "__main__":
 
                 for agent_type, agent_instance, optimizer_instance in agents:
                     print(f"Training agent on {agent_type} rewards")
+                    if agent_type != 'Actual':
+                        next_obs, _ = envs.reset(seed=seed)
+                        next_obs = torch.Tensor(next_obs).to(device)
+                        next_done = torch.zeros(args.num_envs).to(device)
 
                     # PPO Training loop
                     for iteration in range(1, args.num_iterations_per_outer_loop + 1):
