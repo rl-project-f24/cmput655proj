@@ -107,7 +107,6 @@ class Args:
     """the number of iterations per outer loop (computed in runtime)"""
     total_timesteps: int = 0
     """the total timesteps (computed in runtime)"""
-
     
     run_evaluation: bool = False
     """if toggled, will run the result evaluation including storing video"""
