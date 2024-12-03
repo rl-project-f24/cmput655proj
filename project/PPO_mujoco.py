@@ -16,8 +16,8 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 # from sklearn.preprocessing import MinMaxScaler
 
-REWARD_MAX = 1
-REWARD_MIN = 0
+REWARD_MAX = -10
+REWARD_MIN = 10
 # min_max_scaler = MinMaxScaler(feature_range=(REWARD_MIN, REWARD_MAX))
 # fit the scaler to the range of rewards
 # min_max_scaler.fit(np.array([REWARD_MIN, REWARD_MAX]).reshape(-1, 1))
@@ -332,10 +332,12 @@ class RewardTrainer:
 
             # Apply corruption
             if np.random.rand() < self.corruption_percentage:
-                if np.random.rand() < 0.5:
-                    pref = [pref[1], pref[0]]  # Swap preferences
-                else:
-                    pref = [pref[0], pref[1]]
+                pref = [pref[1], pref[0]]  # Swap preferences
+            # if np.random.rand() < self.corruption_percentage:
+            #     if np.random.rand() < 0.5:
+            #         pref = [pref[1], pref[0]]  # Swap preferences
+            #     else:
+            #         pref = [pref[0], pref[1]]
 
             preferences.append((i, i, pref))
 
@@ -430,6 +432,9 @@ if __name__ == "__main__":
     # step_counter = {'Predicted': 0, 'Actual': 0}
     # expected_returns = {'Predicted': [], 'Actual': []}
     # steps = {'Predicted': [], 'Actual': []}
+    if args.env_id == "InvertedPendulum-v4":
+        REWARD_MAX = 1
+        REWARD_MIN = 0
 
     segment_length = 50  # or any fixed length you prefer
 
