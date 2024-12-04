@@ -70,3 +70,4 @@ poetry show -v
 ```
 
 
+poetry env remove 
