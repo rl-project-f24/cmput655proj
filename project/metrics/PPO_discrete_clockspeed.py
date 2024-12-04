@@ -20,10 +20,44 @@ import matplotlib.pyplot as plt
 np.float_ = np.float64
 
 from evaluate_result import evaluate_result
+from collections import deque
 
 import multiprocessing
 from functools import partial
 
+def monitor_iterations(counter, interval=1, window_size=10):
+    """Continuously logs iterations per second, running average, and last 10-second average."""
+    last_count = 0
+    total_elapsed_time = 0  # Keep track of total elapsed time
+    iteration_history = deque(maxlen=window_size)  # Store iteration counts for the last `window_size` seconds
+
+    while True:
+        time.sleep(interval)  # Wait for the specified interval
+        current_count = counter["value"]
+        iterations_per_second = (current_count - last_count) / interval
+        last_count = current_count
+
+        # Update total elapsed time
+        total_elapsed_time += interval
+
+        # Update rolling history
+        iteration_history.append(iterations_per_second)
+
+        # Calculate 10-second average
+        if len(iteration_history) > 0:
+            last_10_second_average = sum(iteration_history) / len(iteration_history)
+        else:
+            last_10_second_average = 0
+
+        # Calculate running average iterations per second
+        running_average = current_count / total_elapsed_time
+
+        print(
+            f"Iterations per second (instantaneous): {iterations_per_second:.2f}, "
+            f"Running average: {running_average:.2f}, "
+            f"Last {window_size}-second average: {last_10_second_average:.2f}, "
+            f"{total_elapsed_time} seconds have elapsed"
+        )
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -276,6 +310,7 @@ class TrajectoryCollector:
                     action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
                 action = action.cpu().numpy()[0]
             obs, reward, terminated, truncated, _ = env.step(action)
+            counter["value"] += 1
             states0.append(obs)
             total_reward0 += reward
             if terminated or truncated:
@@ -298,6 +333,7 @@ class TrajectoryCollector:
                     action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
                 action = action.cpu().numpy()[0]
             obs, reward, terminated, truncated, _ = env.step(action)
+            counter["value"] += 1
             states1.append(obs)
             total_reward1 += reward
             if terminated or truncated:
@@ -382,6 +418,7 @@ class RewardTrainer:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                counter["value"] += 1
 
                 # Calculate accuracy
                 with torch.no_grad():
@@ -422,7 +459,7 @@ def expected_return(agent, env_fn, device, seed, num_episodes=10, gamma=0.99):
 def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
 
-def run_subprocess(seed, run_name, args):
+def run_subprocess(seed, run_name, args, counter):
     eval_flag = args.run_evaluation and seed == evaluation_seed # only evaluate if the seed is the evaluation one
     start_time = time.time()
     print(f"SEED: {seed} STARTING!!!!!")
@@ -570,6 +607,7 @@ def run_subprocess(seed, run_name, args):
 
                         # TRY NOT TO MODIFY: execute the game and log data.
                         next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                        counter["value"] += 1
                         next_obs = torch.Tensor(next_obs_np).to(device)
                         next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
                         actual_reward = torch.Tensor(actual_reward).to(device).view(-1)
@@ -658,6 +696,7 @@ def run_subprocess(seed, run_name, args):
                             loss.backward()
                             nn.utils.clip_grad_norm_(agent_instance.parameters(), args.max_grad_norm)
                             optimizer_instance.step()
+                            counter["value"] += 1
 
                         if args.target_kl is not None and approx_kl > args.target_kl:
                             break
@@ -670,6 +709,7 @@ def run_subprocess(seed, run_name, args):
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
                     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
+                    # counter["value"] += 1
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
@@ -706,22 +746,36 @@ if __name__ == "__main__":
     steps_all = {}
     # agents_eval = {}
 
+    # Use a Manager to create shared state
+    manager = multiprocessing.Manager()
+    counter = manager.dict()
+    counter["value"] = 0  # Initialize the shared counter
+
+    # Launch the monitoring thread
+    monitor_thread = threading.Thread(target=monitor_iterations, args=(counter,), daemon=True)
+    monitor_thread.start()
+
+    # Set up seeds and multiprocessing pool
+    num_seeds = args.num_seeds
+    seeds = list(range(num_seeds))
+    num_processes = multiprocessing.cpu_count()
+    if args.num_processes > 0:
+        num_processes = args.num_processes
 
     num_seeds = args.num_seeds
     seeds = list(range(num_seeds))
     # Define the seed for evaluation
     evaluation_seed = seeds[0]  # Select the first seed for evaluation
+    print(f"using {num_processes} threads to complete {num_seeds} seeds")
+
 
 
     if args.use_multithreading: 
-        num_processes = multiprocessing.cpu_count()
-        if args.num_processes > 0:
-            num_processes = args.num_processes
-        print(f"Using {num_processes} threads to complete {num_seeds} seeds")
         run_subprocess_partial = partial(
             run_subprocess,
             run_name=run_name,
             args=args,
+            counter=counter  # Pass the managed shared counter
         )
 
         with multiprocessing.Pool(processes=num_processes) as pool:
