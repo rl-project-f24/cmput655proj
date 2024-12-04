@@ -339,10 +339,12 @@ class RewardTrainer:
 
             # Apply corruption
             if np.random.rand() < self.corruption_percentage:
-                if np.random.rand() < 0.5:
-                    pref = [pref[1], pref[0]]  # Swap preferences
-                else:
-                    pref = [pref[0], pref[1]]
+                pref = [pref[1], pref[0]]  # Swap preferences
+            # if np.random.rand() < self.corruption_percentage:
+            #     if np.random.rand() < 0.5:
+            #         pref = [pref[1], pref[0]]  # Swap preferences
+            #     else:
+            #         pref = [pref[0], pref[1]]
 
             preferences.append((i, i, pref))
 
@@ -712,7 +714,7 @@ if __name__ == "__main__":
     )
 
     num_processes = multiprocessing.cpu_count()
-    num_processes = 10
+    # num_processes = 10
 
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = pool.map(run_subprocess_partial, seeds)
