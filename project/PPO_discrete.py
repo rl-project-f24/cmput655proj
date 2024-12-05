@@ -4,6 +4,8 @@ import threading
 import time
 import copy
 from dataclasses import dataclass
+import logging
+from tqdm import tqdm
 
 import gymnasium as gym
 import numpy as np
@@ -23,6 +25,9 @@ from evaluate_result import evaluate_result
 
 import multiprocessing
 from functools import partial
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Args:
@@ -439,9 +444,9 @@ class RewardTrainer:
 
             avg_loss = np.mean(epoch_losses)
             avg_accuracy = np.mean(epoch_accuracies)
-            if epoch == n_epochs-1:
-                print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
-                reward_accuracy = avg_accuracy
+            # if epoch == n_epochs-1:
+            #     print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            #     reward_accuracy = avg_accuracy
         return reward_accuracy
 
 
@@ -480,6 +485,7 @@ def run_subprocess(seed, run_name, args):
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    # device = torch.device("cpu")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
@@ -497,9 +503,12 @@ def run_subprocess(seed, run_name, args):
     # Define corruption percentages
     corruption_percentages = [0, 5, 20, 50]
 
-    for cp in corruption_percentages:
+    corruption_bar = tqdm(corruption_percentages, desc=f"Seed {seed} Corruption", unit="%", leave=False, position=1)
+    for cp in corruption_bar:
+        corruption_bar.set_postfix({"Corruption %": cp})
         reward_accuracy_this_cp = []
-        print(f"Seed: {seed} | Processing Corruption Percentage: {cp}%")
+        # print(f"Seed: {seed} | Processing Corruption Percentage: {cp}%")
+        tqdm.write(f"Seed: {seed} | Processing Corruption Percentage: {cp}%")
         args.corruption_percentage = cp
 
         # Initialize Reward Predictor and Trainer
@@ -537,8 +546,11 @@ def run_subprocess(seed, run_name, args):
         next_obs = torch.Tensor(next_obs).to(device)
         next_done = torch.zeros(args.num_envs).to(device)
 
-        for d in range(args.D):
-            print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
+        # for d in range(args.D):
+        outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
+        for d in outer_loop_bar:
+            outer_loop_bar.set_postfix({"Iteration": d + 1})
+            # print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
 
             # Collect trajectories
             use_random_policy = (d == 0)  # Use random policy in the first iteration
@@ -578,7 +590,9 @@ def run_subprocess(seed, run_name, args):
                 agents = [('Predicted', agent_predicted, optimizer_predicted)]
                 global_step = 0
 
-            for agent_type, agent_instance, optimizer_instance in agents:
+            agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
+            for agent_type, agent_instance, optimizer_instance in agent_bar:
+                agent_bar.set_postfix({"Agent Type": agent_type})
                 # print(f"Seed: {seed} | Training agent on {agent_type} rewards")
 
                 # Initialize PPO storage variables
@@ -596,7 +610,22 @@ def run_subprocess(seed, run_name, args):
                     next_done = torch.zeros(args.num_envs).to(device)
 
                 # PPO Training loop
+                # for iteration in range(1, args.num_iterations_per_outer_loop + 1):
+                                    # Nested progress bar for PPO iterations
+                ppo_bar = tqdm(
+                    total=args.num_iterations_per_outer_loop,
+                    desc=f"PPO Training Loop for ({agent_type})",
+                    unit="iteration",
+                    leave=False,
+                    position=4
+                )
+                avg_return = 0
                 for iteration in range(1, args.num_iterations_per_outer_loop + 1):
+                    ppo_bar.update(1)
+                    ppo_bar.set_postfix({"Iteration": iteration, "Last Return": avg_return})
+                    total_iterations = args.num_iterations_per_outer_loop * args.D
+                    current_iteration = iteration + d * args.num_iterations_per_outer_loop
+
                     total_iterations = args.num_iterations_per_outer_loop * args.D
                     current_iteration = iteration + d * args.num_iterations_per_outer_loop
                     # Annealing the rate if instructed to do so.
@@ -719,12 +748,17 @@ def run_subprocess(seed, run_name, args):
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
-                    if iteration % 10 == 0:
-                        print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
+                    # if iteration % 10 == 0:
+                    #     logger.info(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
+                                                    # Force refresh to fix blank lines
+                    corruption_bar.refresh()
+                    outer_loop_bar.refresh()
+                    agent_bar.refresh()
+                    ppo_bar.refresh()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
@@ -738,20 +772,20 @@ def run_subprocess(seed, run_name, args):
             # elif agent_type == 'Actual' and cp == 0:
             #     agents_eval_this[key] = copy.deepcopy(agent_actual)
 
-    envs.close()
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Seed {seed} DONE!!!!!!!!!!!!!!!!! Execution time: {elapsed_time:.4f} seconds")
-    return expected_returns_this, steps_this, reward_accuracy_this
+        envs.close()
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        logger.info(f"Seed {seed} DONE!!!!!!!!!!!!!!!!! Execution time: {elapsed_time:.4f} seconds")
+        return expected_returns_this, steps_this, reward_accuracy_this
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sibling_folder = os.path.join(current_dir, '..', 'summary_data')
     if not os.path.exists(sibling_folder):
         os.makedirs(sibling_folder)
-        print(f"Directory '{sibling_folder}' created.")
+        logger.info(f"Directory '{sibling_folder}' created.")
     else:
-        print(f"Directory '{sibling_folder}' already exists.")
+        logger.info(f"Directory '{sibling_folder}' already exists.")
         
     args = tyro.cli(Args)
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
@@ -773,25 +807,29 @@ if __name__ == "__main__":
     # Define the seed for evaluation
     evaluation_seed = seeds[0]  # Select the first seed for evaluation
 
-
+    results = []
     if args.use_multithreading: 
         num_processes = 3
         if args.num_processes > 0:
             num_processes = args.num_processes
-        # print(f"Using {num_processes} threads to complete {num_seeds} seeds")
+        logger.info(f"Using {num_processes} threads to complete {num_seeds} seeds")
         run_subprocess_partial = partial(
             run_subprocess,
             run_name=run_name,
             args=args,
         )
 
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.map(run_subprocess_partial, seeds)
+        with tqdm(total=len(seeds), desc="Running seeds", position=0) as seed_bar:
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                for result in pool.imap_unordered(run_subprocess_partial, seeds):
+                    seed_bar.update(1)
+                    results.append(result)
     else:
-        results = []
-        for seed in seeds:
-            result = run_subprocess(seed, run_name, args)
-            results.append(result)
+        logger.info(f"Running sequentially with {num_seeds} seeds")
+        with tqdm(seeds, desc="Seeds", unit="seed", position=0) as seed_bar:
+            for seed in seed_bar:
+                result = run_subprocess(seed, run_name, args)
+                results.append(result)
 
     baseline_key = 'Actual cp=0%'
     baseline = []
