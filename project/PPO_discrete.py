@@ -180,9 +180,13 @@ class AgentDiscrete(nn.Module):
 
 # Reward Predictor Network
 class RewardPredictorNetwork(nn.Module):
-    def __init__(self, observation_space, env_id):
+    def __init__(self, observation_space, action_space, env_id):
         super().__init__()
-        input_dim = np.prod(observation_space.shape)
+        if isinstance(action_space, gym.spaces.Discrete):
+            action_dim = action_space.n # one-hot encoded action
+        else:
+            action_dim = np.prod(action_space.shape)
+        input_dim = np.prod(observation_space.shape) + action_dim
         hidden_size = 256
         self.network = nn.Sequential(
             layer_init(nn.Linear(input_dim, hidden_size)),
@@ -195,13 +199,30 @@ class RewardPredictorNetwork(nn.Module):
         )
         self.sigmoid = nn.Sigmoid()
         self.env_id = env_id
+        self.action_space = action_space
 
-    def forward(self, x):
+    def forward(self, x, actions):
         # x shape: [batch_size, sequence_length, observation_dim]
+        # actions shape: [batch_size, sequence_length]
         batch_size, sequence_length, obs_dim = x.shape
-        x = x.view(-1, obs_dim)  # Flatten to [batch_size * sequence_length, obs_dim]
+
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            num_actions = self.action_space.n
+            actions = actions.long().view(-1)  # Flatten to [batch_size * sequence_length]
+            actions_one_hot = torch.nn.functional.one_hot(actions, num_classes=num_actions).float()
+            actions_one_hot = actions_one_hot.view(batch_size, sequence_length, -1)
+            action_dim = num_actions
+        else:
+            action_dim = self.action_space.shape[0]
+            actions = actions.view(batch_size, sequence_length, action_dim)
+            actions_one_hot = actions
+
+        x = torch.cat([x, actions_one_hot], dim=-1)  # Concatenate on the last dimension
+        x = x.view(-1, obs_dim + action_dim)  # Flatten to [batch_size * sequence_length, obs_dim + action_dim]
         outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
         # outputs = outputs_original
+        
+        
         if self.env_id == "Acrobot-v1":
             outputs = -self.sigmoid(outputs_original)
         else:
@@ -224,11 +245,15 @@ class PreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         seg1_id, seg2_id, pref = self.preferences[idx]
-        seg1 = self.pad_or_truncate(self.segments0[seg1_id])
-        seg2 = self.pad_or_truncate(self.segments1[seg2_id])
+        seg1_obs = self.pad_or_truncate(self.segments0[seg1_id][0])
+        seg1_actions = self.pad_or_truncate_actions(self.segments0[seg1_id][1])
+        seg2_obs = self.pad_or_truncate(self.segments1[seg2_id][0])
+        seg2_actions = self.pad_or_truncate_actions(self.segments1[seg2_id][1])
         return (
-            torch.FloatTensor(seg1),
-            torch.FloatTensor(seg2),
+            torch.FloatTensor(seg1_obs),
+            torch.FloatTensor(seg1_actions),
+            torch.FloatTensor(seg2_obs),
+            torch.FloatTensor(seg2_actions),
             torch.FloatTensor(pref),
         )
 
@@ -244,6 +269,20 @@ class PreferenceDataset(Dataset):
             segment = segment[:self.segment_length]
         return segment
 
+    def pad_or_truncate_actions(self, actions):
+        length = len(actions)
+        if length < self.segment_length:
+            # Pad with zeros
+            pad_size = self.segment_length - length
+            if isinstance(actions[0], np.integer):
+                padding = np.zeros(pad_size, dtype=np.int64)
+            else: 
+                padding = np.zeros((pad_size, *actions.shape[1:]))
+            actions = np.concatenate([actions, padding], axis=0)
+        else:
+            # Truncate to the fixed length
+            actions = actions[:self.segment_length]
+        return actions
 
 # Trajectory Collector
 class TrajectoryCollector:
@@ -258,6 +297,7 @@ class TrajectoryCollector:
         # collect 2 trajectories with the same start
         env = self.env_fn()
         states0, states1 = [], []
+        actions0, actions1 = [], []
         
         seed = np.random.randint(0, 2**16 - 1)
         
@@ -275,6 +315,7 @@ class TrajectoryCollector:
                 with torch.no_grad():
                     action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
                 action = action.cpu().numpy()[0]
+            actions0.append(action)
             obs, reward, terminated, truncated, _ = env.step(action)
             states0.append(obs)
             total_reward0 += reward
@@ -297,6 +338,7 @@ class TrajectoryCollector:
                 with torch.no_grad():
                     action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
                 action = action.cpu().numpy()[0]
+            actions1.append(action)
             obs, reward, terminated, truncated, _ = env.step(action)
             states1.append(obs)
             total_reward1 += reward
@@ -306,15 +348,15 @@ class TrajectoryCollector:
                 obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
 
         env.close()
-        return np.array(states0), total_reward0, np.array(states1), total_reward1
+        return np.array(states0), total_reward0, np.array(actions0), np.array(states1), total_reward1, np.array(actions1)
 
     def collect_trajectories(self, n_trajectories):
         trajectories0 = {}
         trajectories1 = {}
         for i in range(n_trajectories):
-            states0, reward0, states1, reward1 = self.collect_trajectory()
-            trajectories0[i] = (states0, reward0)
-            trajectories1[i] = (states1, reward1)
+            states0, reward0, actions0, states1, reward1, actions1 = self.collect_trajectory()
+            trajectories0[i] = (states0, actions0, reward0)
+            trajectories1[i] = (states1, actions1, reward1)
         return trajectories0, trajectories1
 
 
@@ -332,8 +374,8 @@ class RewardTrainer:
 
         for i in range(n_preferences):
             # i = np.random.choice(traj_ids, size=1, replace=True)[0]
-            reward_i = trajectories0[i][1]
-            reward_j = trajectories1[i][1]
+            reward_i = trajectories0[i][2]
+            reward_j = trajectories1[i][2]
 
             if reward_i - reward_j > 0:
                 pref = [1.0, -1.0]
@@ -360,14 +402,16 @@ class RewardTrainer:
         for epoch in range(n_epochs):
             epoch_losses = []
             epoch_accuracies = []
-            for s1, s2, prefs in dataloader:
+            for s1, a1, s2, a2, prefs in dataloader:
                 s1 = s1.to(self.device)
                 s2 = s2.to(self.device)
+                a1 = a1.to(self.device)
+                a2 = a2.to(self.device)
                 prefs = prefs.to(self.device)
 
                 # Get predicted rewards
-                r1 = self.predictor(s1).squeeze(-1)  # shape: [batch_size, sequence_length]
-                r2 = self.predictor(s2).squeeze(-1)
+                r1 = self.predictor(s1, a1).squeeze(-1)  # shape: [batch_size, sequence_length]
+                r2 = self.predictor(s2, a2).squeeze(-1)
 
                 # Sum over time steps
                 r1_sum = r1.sum(dim=1)  # shape: [batch_size]
@@ -451,7 +495,7 @@ def run_subprocess(seed, run_name, args):
     segment_length = 50  # or any fixed length you prefer
 
     # Define corruption percentages
-    corruption_percentages = [0]
+    corruption_percentages = [0, 5, 20, 50]
 
     for cp in corruption_percentages:
         reward_accuracy_this_cp = []
@@ -459,7 +503,7 @@ def run_subprocess(seed, run_name, args):
         args.corruption_percentage = cp
 
         # Initialize Reward Predictor and Trainer
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, args.env_id)
+        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space, args.env_id)
         reward_trainer = RewardTrainer(
             reward_predictor,
             device=device,
@@ -506,8 +550,8 @@ def run_subprocess(seed, run_name, args):
                 use_random_policy=use_random_policy,
             )
             trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories)
-            segments0 = {k: v[0] for k, v in trajectories0.items()}  # Only store states
-            segments1 = {k: v[0] for k, v in trajectories1.items()}  # Only store states
+            segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
+            segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
 
             # Generate preferences
             preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
@@ -587,10 +631,8 @@ def run_subprocess(seed, run_name, args):
                         else:
                             with torch.no_grad():
                                 # next_obs shape: [num_envs, obs_dim]
-                                predicted_reward = reward_predictor(next_obs.unsqueeze(1)).squeeze(-1).squeeze(-1)
+                                predicted_reward = reward_predictor(next_obs.unsqueeze(1), action.unsqueeze(1)).squeeze(-1).squeeze(-1)
                             rewards[step] = predicted_reward
-
-                    # PPO Update code remains the same...
                     # bootstrap value if not done
                     with torch.no_grad():
                         next_value = agent_instance.get_value(next_obs).reshape(1, -1)
