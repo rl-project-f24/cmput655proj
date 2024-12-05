@@ -14,7 +14,6 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import matplotlib.pyplot as plt
 from torch.distributions.categorical import Categorical
 import matplotlib.pyplot as plt
 
@@ -25,25 +24,15 @@ from evaluate_result import evaluate_result
 import multiprocessing
 from functools import partial
 
-# from RL_classes import *
-
-
-
-# from sklearn.preprocessing import MinMaxScaler
-
 REWARD_MAX = 10
 REWARD_MIN = -10
-# min_max_scaler = MinMaxScaler(feature_range=(REWARD_MIN, REWARD_MAX))
-# fit the scaler to the range of rewards
-# min_max_scaler.fit(np.array([REWARD_MIN, REWARD_MAX]).reshape(-1, 1))
 
 @dataclass
 class Args:
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
+
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
@@ -108,8 +97,8 @@ class Args:
     """learning rate for the reward predictor"""
     num_trajectories: int = 100
     """number of trajectories to collect for reward predictor training"""
-    num_preferences: int = 1000
-    """number of preference comparisons to generate"""
+    # num_preferences: int = 1000
+    # """number of preference comparisons to generate"""
     reward_training_epochs: int = 9
     """number of epochs to train the reward predictor"""
     corruption_percentage: float = 0.0
@@ -131,9 +120,6 @@ class Args:
     """Whether to run the seeds in thread pool, or sequentially"""
     num_processes: int = 0
     """number of processes to use in multithreading, if 0 or less, uses total count of cpu cores python can count (all cores)"""
-
-
-
 
 
 
@@ -558,7 +544,6 @@ def run_subprocess(seed, run_name, args):
         # Global step and start time
         global_step = 0
 
-
         # Reset step counters and expected returns for agents
         if cp == 0:
             step_counter = {'Predicted': 0, 'Actual': 0}
@@ -570,21 +555,12 @@ def run_subprocess(seed, run_name, args):
             steps = {'Predicted': []}
             
         # for actual agent
-        # Initialize Reward Predictor and Trainer
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space)
-        reward_trainer = RewardTrainer(
-            reward_predictor,
-            device=device,
-            lr=args.reward_learning_rate,
-            corruption_percentage=args.corruption_percentage,
-        )
-        # for actual agent
         next_obs, _ = envs.reset(seed=seed)
         next_obs = torch.Tensor(next_obs).to(device)
         next_done = torch.zeros(args.num_envs).to(device)
 
         for d in range(args.D):
-            print(f"Outer iteration {d+1}/{args.D}")
+            print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
 
             # Collect trajectories
             use_random_policy = (d == 0)  # Use random policy in the first iteration
@@ -606,7 +582,7 @@ def run_subprocess(seed, run_name, args):
             dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
             dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
             # Train reward predictor
-            print("Training the Reward Predictor...")
+            # print("Training the Reward Predictor...")
             reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs)
             reward_accuracy_this_cp.append(reward_accuracy)
 
@@ -616,7 +592,6 @@ def run_subprocess(seed, run_name, args):
             # if d == args.D - 1:
             if cp == 0:
 
-                
                 # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
                 # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
                 agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
@@ -759,8 +734,6 @@ def run_subprocess(seed, run_name, args):
                     y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
                     var_y = np.var(y_true)
                     explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-
 
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma))
                     expected_returns[agent_type].append(avg_return)
