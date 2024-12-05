@@ -356,6 +356,7 @@ class RewardTrainer:
         return preferences
 
     def train_on_dataloader(self, dataloader, n_epochs=1):
+        reward_accuracy = 0
         for epoch in range(n_epochs):
             epoch_losses = []
             epoch_accuracies = []
@@ -394,10 +395,13 @@ class RewardTrainer:
 
             avg_loss = np.mean(epoch_losses)
             avg_accuracy = np.mean(epoch_accuracies)
-            print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            if epoch == n_epochs-1:
+                print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+                reward_accuracy = avg_accuracy
+        return reward_accuracy
 
 
-def expected_return(agent, env_fn, device, seed, num_episodes=10, gamma=0.99):
+def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
@@ -425,7 +429,7 @@ def smooth(data, span):
 def run_subprocess(seed, run_name, args):
     eval_flag = args.run_evaluation and seed == evaluation_seed # only evaluate if the seed is the evaluation one
     start_time = time.time()
-    print(f"SEED: {seed} STARTING!!!!!")
+    # print(f"SEED: {seed} STARTING!!!!!")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -442,13 +446,15 @@ def run_subprocess(seed, run_name, args):
 
     expected_returns_this = {}
     steps_this = {}
+    reward_accuracy_this = []
 
     segment_length = 50  # or any fixed length you prefer
 
     # Define corruption percentages
-    corruption_percentages = [0, 15, 50]
+    corruption_percentages = [0]
 
     for cp in corruption_percentages:
+        reward_accuracy_this_cp = []
         print(f"Seed: {seed} | Processing Corruption Percentage: {cp}%")
         args.corruption_percentage = cp
 
@@ -510,8 +516,9 @@ def run_subprocess(seed, run_name, args):
             dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
             dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
             # Train reward predictor
-            print(f"Seed: {seed} | Training the Reward Predictor...")
-            reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs)
+            # print(f"Seed: {seed} | Training the Reward Predictor...")
+            reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs)
+            reward_accuracy_this_cp.append(reward_accuracy)
 
             # agent_end_of_d_minus_one = copy.deepcopy(agent)
             # agent_predicted = agent_end_of_d_minus_one
@@ -522,13 +529,13 @@ def run_subprocess(seed, run_name, args):
                 # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
                 # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
                 # agents  = [('Actual', agent_actual, optimizer_actual)]
-                agents  = [('Predicted', agent_predicted, optimizer_predicted), ('Actual', agent_actual, optimizer_actual)]
+                agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
             else:
                 agents = [('Predicted', agent_predicted, optimizer_predicted)]
                 global_step = 0
 
             for agent_type, agent_instance, optimizer_instance in agents:
-                print(f"Seed: {seed} | Training agent on {agent_type} rewards")
+                # print(f"Seed: {seed} | Training agent on {agent_type} rewards")
 
                 # Initialize PPO storage variables
                 obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -666,16 +673,18 @@ def run_subprocess(seed, run_name, args):
                     var_y = np.var(y_true)
                     explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, num_episodes=10, gamma=args.gamma))
+                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
-                    print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
+                    if iteration % 10 == 0:
+                        print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
         
         # Store results for plotting
+        reward_accuracy_this.append(reward_accuracy_this_cp)
         for agent_type in expected_returns.keys():
             key = f"{agent_type} cp={cp}%"
             expected_returns_this[key] = [expected_returns[agent_type]]
@@ -690,9 +699,17 @@ def run_subprocess(seed, run_name, args):
     end_time = time.time()
     elapsed_time = end_time - start_time
     print(f"Seed {seed} DONE!!!!!!!!!!!!!!!!! Execution time: {elapsed_time:.4f} seconds")
-    return expected_returns_this, steps_this
+    return expected_returns_this, steps_this, reward_accuracy_this
 
 if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    sibling_folder = os.path.join(current_dir, '..', 'summary_data')
+    if not os.path.exists(sibling_folder):
+        os.makedirs(sibling_folder)
+        print(f"Directory '{sibling_folder}' created.")
+    else:
+        print(f"Directory '{sibling_folder}' already exists.")
+        
     args = tyro.cli(Args)
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -704,6 +721,7 @@ if __name__ == "__main__":
     # Initialize dictionaries to store results
     expected_returns_all = {}
     steps_all = {}
+    reward_accuracy_all = []
     # agents_eval = {}
 
 
@@ -714,10 +732,10 @@ if __name__ == "__main__":
 
 
     if args.use_multithreading: 
-        num_processes = multiprocessing.cpu_count()
+        num_processes = 3
         if args.num_processes > 0:
             num_processes = args.num_processes
-        print(f"Using {num_processes} threads to complete {num_seeds} seeds")
+        # print(f"Using {num_processes} threads to complete {num_seeds} seeds")
         run_subprocess_partial = partial(
             run_subprocess,
             run_name=run_name,
@@ -732,25 +750,67 @@ if __name__ == "__main__":
             result = run_subprocess(seed, run_name, args)
             results.append(result)
 
-    for expected_returns_this, steps_this in results:
+    baseline_key = 'Actual cp=0%'
+    baseline = []
+    for expected_returns_this, steps_this, reward_accuracy_this in results:
         for key in expected_returns_this:
+            if key == baseline_key:
+                baseline.extend(expected_returns_this[key])
+                continue
             if key not in expected_returns_all:
                 expected_returns_all[key] = []
                 steps_all[key] = steps_this[key]
             expected_returns_all[key].extend(expected_returns_this[key])
+        reward_accuracy_all.append(reward_accuracy_this)
+    arr = np.array(reward_accuracy_all)
+    arr = arr.reshape(len(reward_accuracy_all), len(reward_accuracy_all[0]), len(reward_accuracy_all[0][0]))
+    last_elements = arr[:, :, -1]
+    reward_accuracy_last_iteration = list(np.mean(last_elements, axis=0))
+
         
     # Plotting the expected return comparison
+    custom_labels = {
+        'Actual cp=0%': 'PPO with task reward',
+        'Predicted cp=0%': r'$\epsilon$ = 0',
+        'Predicted cp=5%': r'$\epsilon$ = 0.05',
+        'Predicted cp=20%': r'$\epsilon$ = 0.2',
+        'Predicted cp=50%': r'$\epsilon$ = 0.5'
+    }
+    file = open(f'summary_data/{run_name}_{args.env_id}.txt', 'w')
+    file.write("training accuracy for corruption percentages of 0, 5, 20, 50\n")
+    file.write("\t".join([f"{num:.3f}" for num in reward_accuracy_last_iteration]))
+    file.write("\n")
+    file.write("error rate\tmean\tsd\n")
+
     plt.figure()
+    
+    data_stack = np.vstack(baseline)
+    mean_values = np.mean(data_stack, axis=0)
+    std_values = np.std(data_stack, axis=0)
+    file.write(f"{baseline_key}\t{mean_values[-1]:.3f}\t{std_values[-1]:.3f}\n")
+    plt.plot(steps_all['Predicted cp=0%'], mean_values, label=custom_labels[baseline_key], linestyle='--')
+
+    
     for agent_type in expected_returns_all:
         data_stack = np.vstack(expected_returns_all[agent_type])
         mean_values = np.mean(data_stack, axis=0)
         std_values = np.std(data_stack, axis=0)
-        plt.plot(steps_all[agent_type], mean_values, label=agent_type)
+        file.write(f"{agent_type}\t{mean_values[-1]:.3f}\t{std_values[-1]:.3f}\n")
+        plt.plot(steps_all[agent_type], mean_values, label=custom_labels.get(agent_type, agent_type))
         plt.fill_between(np.asarray(steps_all[agent_type]), mean_values - std_values, mean_values + std_values, alpha=0.15)
-    plt.xlabel('Steps')
-    plt.ylabel('Expected Return')
+    
+    file.close()
+    
+    plt.xlim(left=0, right=args.total_timesteps_per_iteration*args.D)
+    if args.env_id == 'CartPole-v1':
+        plt.ylim(top=500)
+    if args.env_id == 'Acrobot-v1':
+        plt.ylim(top = 0, bottom =-500)
+    plt.grid(True, color='gray', alpha=0.3)
+    plt.xlabel('Timesteps')
+    plt.ylabel('Episode Return')
     plt.legend()
-    plt.title(f'Expected Return Comparison: D={args.D}, env={args.env_id}, num_seeds={num_seeds}')
+    plt.title(f'PPO on preference data with errors, in {args.env_id}')
     plt.savefig(f"runs/{run_name}/expected_return_comparison_{args.env_id}.png")
     plt.show()
 
