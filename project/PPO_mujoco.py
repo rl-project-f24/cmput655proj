@@ -518,7 +518,7 @@ def run_subprocess(seed, run_name, args):
 
 
     # Define corruption percentages
-    corruption_percentages = [0, 5, 20, 50]
+    corruption_percentages = [0, 50]
 
     for cp in corruption_percentages:
         reward_accuracy_this_cp = []
@@ -641,6 +641,7 @@ def run_subprocess(seed, run_name, args):
                         logprobs[step] = logprob
 
                         # TRY NOT TO MODIFY: execute the game and log data.
+                        prev_obs = next_obs
                         next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
                         next_obs = torch.Tensor(next_obs_np).to(device)
                         next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
@@ -652,7 +653,7 @@ def run_subprocess(seed, run_name, args):
                         else:
                             with torch.no_grad():
                                 # next_obs shape: [num_envs, obs_dim]
-                                predicted_reward = reward_predictor(next_obs.unsqueeze(1), action.unsqueeze(1)).squeeze(-1).squeeze(-1)
+                                predicted_reward = reward_predictor(prev_obs.unsqueeze(1), action.unsqueeze(1)).squeeze(-1).squeeze(-1)
                             rewards[step] = predicted_reward
                     # bootstrap value if not done
                     with torch.no_grad():
