@@ -24,8 +24,6 @@ from evaluate_result import evaluate_result
 import multiprocessing
 from functools import partial
 
-REWARD_MAX = 10
-REWARD_MIN = -10
 
 @dataclass
 class Args:
@@ -55,6 +53,10 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the id of the environment"""
+    reward_min: int = -10
+    """the min clip of environment reward funciton"""
+    reward_max: int = 10
+    """the max clip of environment reward funciton"""
     num_seeds: int = 1
     """number of seeds to run everythhing"""
     total_timesteps_per_iteration: int = 10000
@@ -135,7 +137,7 @@ def step_trigger(step_number):
     # return step_number % 1000 == 0  # Record every 1000 steps   
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma):
+def make_env(env_id, idx, capture_video, run_name, gamma, reward_min, reward_max):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
@@ -149,7 +151,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, REWARD_MIN, REWARD_MAX))
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, reward_min, reward_max))
         return env
 
     return thunk
@@ -195,7 +197,7 @@ class Agent(nn.Module):
 
 # Reward Predictor Network
 class RewardPredictorNetwork(nn.Module):
-    def __init__(self, observation_space, action_space):
+    def __init__(self, observation_space, action_space, reward_min, reward_max):
         super().__init__()
         if isinstance(action_space, gym.spaces.Discrete):
             action_dim = action_space.n # one-hot encoded action
@@ -214,6 +216,8 @@ class RewardPredictorNetwork(nn.Module):
         )
         self.sigmoid = nn.Sigmoid()
         self.action_space = action_space
+        self.reward_min = reward_min
+        self.reward_max = reward_max
 
     def forward(self, x, actions):
         # x shape: [batch_size, sequence_length, observation_dim]
@@ -238,7 +242,7 @@ class RewardPredictorNetwork(nn.Module):
         outputs = self.sigmoid(outputs_original)  # Apply sigmoid
         
         # scale the outputs to the desired reward range
-        outputs = outputs * (REWARD_MAX - REWARD_MIN) + REWARD_MIN
+        outputs = outputs * (self.reward_max - self.reward_min) + self.reward_min
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
         return outputs  # Shape: [batch_size, sequence_length, 1]
@@ -496,9 +500,9 @@ def run_subprocess(seed, run_name, args):
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, args.reward_min, args.reward_max) for i in range(args.num_envs)]
     )
-    env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name, args.gamma)()
+    env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name, args.gamma, args.reward_min, args.reward_max)()
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     expected_returns_this = {}
@@ -509,9 +513,6 @@ def run_subprocess(seed, run_name, args):
     # step_counter = {'Predicted': 0, 'Actual': 0}
     # expected_returns = {'Predicted': [], 'Actual': []}
     # steps = {'Predicted': [], 'Actual': []}
-    if args.env_id == "InvertedPendulum-v4":
-        REWARD_MAX = 1
-        REWARD_MIN = 0
 
     segment_length = 50  # or any fixed length you prefer
 
@@ -525,7 +526,7 @@ def run_subprocess(seed, run_name, args):
         args.corruption_percentage = cp
 
         # Initialize Reward Predictor and Trainer
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space)
+        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space, args.reward_min, args.reward_max)
         reward_trainer = RewardTrainer(
             reward_predictor,
             device=device,
@@ -780,6 +781,10 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 
+    if args.env_id == "InvertedPendulum-v4":
+        args.reward_min = 0
+        args.reward_max = 1
+
     # Initialize dictionaries to store results
     expected_returns_all = {}
     steps_all = {}
@@ -824,6 +829,8 @@ if __name__ == "__main__":
                 steps_all[key] = steps_this[key]
             expected_returns_all[key].extend(expected_returns_this[key])
         reward_accuracy_all.append(reward_accuracy_this)
+
+    # store reward accuracy of last iteration, averaged over all seeds
     arr = np.array(reward_accuracy_all)
     arr = arr.reshape(len(reward_accuracy_all), len(reward_accuracy_all[0]), len(reward_accuracy_all[0][0]))
     last_elements = arr[:, :, -1]
@@ -851,6 +858,7 @@ if __name__ == "__main__":
     std_values = np.std(data_stack, axis=0)
     file.write(f"{baseline_key}\t{mean_values[-1]:.3f}\t{std_values[-1]:.3f}\n")
     plt.plot(steps_all['Predicted cp=0%'], mean_values, label=custom_labels[baseline_key], linestyle='--')
+    plt.fill_between(steps_all['Predicted cp=0%'], mean_values - std_values, mean_values + std_values, alpha=0.15)
 
     
     for agent_type in expected_returns_all:
@@ -864,10 +872,8 @@ if __name__ == "__main__":
     file.close()
     
     plt.xlim(left=0, right=args.total_timesteps_per_iteration*args.D)
-    if args.env_id == 'CartPole-v1':
-        plt.ylim(top=500)
-    if args.env_id == 'Acrobot-v1':
-        plt.ylim(top = 0, bottom =-500)
+    if args.env_id == 'InvertedPendulum-v4':
+        plt.ylim(bottom=0, top=1000)
     plt.grid(True, color='gray', alpha=0.3)
     plt.xlabel('Timesteps')
     plt.ylabel('Episode Return')

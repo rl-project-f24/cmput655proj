@@ -804,6 +804,8 @@ if __name__ == "__main__":
                 steps_all[key] = steps_this[key]
             expected_returns_all[key].extend(expected_returns_this[key])
         reward_accuracy_all.append(reward_accuracy_this)
+
+    # store reward accuracy of last iteration, averaged over all seeds
     arr = np.array(reward_accuracy_all)
     arr = arr.reshape(len(reward_accuracy_all), len(reward_accuracy_all[0]), len(reward_accuracy_all[0][0]))
     last_elements = arr[:, :, -1]
@@ -830,7 +832,9 @@ if __name__ == "__main__":
     mean_values = np.mean(data_stack, axis=0)
     std_values = np.std(data_stack, axis=0)
     file.write(f"{baseline_key}\t{mean_values[-1]:.3f}\t{std_values[-1]:.3f}\n")
+    # plot baseline: actual 0%
     plt.plot(steps_all['Predicted cp=0%'], mean_values, label=custom_labels[baseline_key], linestyle='--')
+    plt.fill_between(steps_all['Predicted cp=0%'], mean_values - std_values, mean_values + std_values, alpha=0.15)
 
     
     for agent_type in expected_returns_all:
@@ -845,9 +849,9 @@ if __name__ == "__main__":
     
     plt.xlim(left=0, right=args.total_timesteps_per_iteration*args.D)
     if args.env_id == 'CartPole-v1':
-        plt.ylim(top=500)
+        plt.ylim(bottom=0, top=500)
     if args.env_id == 'Acrobot-v1':
-        plt.ylim(top = 0, bottom =-500)
+        plt.ylim(bottom=-500, top=0)
     plt.grid(True, color='gray', alpha=0.3)
     plt.xlabel('Timesteps')
     plt.ylabel('Episode Return')
