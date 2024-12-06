@@ -128,6 +128,10 @@ class Args:
     """number of processes to use in multithreading, if 0 or less, uses total count of cpu cores python can count (all cores)"""
     use_profiler: bool = False
     """Whether to run the profiler and save to local dir after completion"""
+    device: str = "" 
+    """Device to be used for training"""
+
+
 
 
 
@@ -502,6 +506,9 @@ def run_subprocess(seed, run_name, args):
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if args.device != "":
+        device = torch.device(args.device)
+    logger.info(f"Using device {device}")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
