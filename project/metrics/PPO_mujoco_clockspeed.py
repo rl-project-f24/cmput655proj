@@ -915,7 +915,7 @@ if __name__ == "__main__":
         logger.info(f"Running sequentially with {num_seeds} seeds")
         with tqdm(seeds, desc="Seeds", unit="seed", position=0) as seed_bar:
             for seed in seed_bar:
-                result = run_subprocess(seed, run_name, args)
+                result = run_subprocess(seed, run_name, args, counter)
                 results.append(result)
 
     # ! PROFILER HERE
