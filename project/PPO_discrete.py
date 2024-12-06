@@ -27,7 +27,9 @@ import multiprocessing
 from functools import partial
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
+import cProfile
+import pstats
+import io
 
 @dataclass
 class Args:
@@ -120,7 +122,8 @@ class Args:
     """Whether to run the seeds in thread pool, or sequentially"""
     num_processes: int = 0
     """number of processes to use in multithreading, if 0 or less, uses total count of cpu cores python can count (all cores)"""
-
+    use_profiler: bool = False
+    """Whether to run the profiler and save to local dir after completion"""
 
 
 
@@ -625,11 +628,11 @@ def run_subprocess(seed, run_name, args):
                     ppo_bar.set_postfix({"Iteration": iteration, "Last Return": avg_return})
                     total_iterations = args.num_iterations_per_outer_loop * args.D
                     current_iteration = iteration + d * args.num_iterations_per_outer_loop
-
                     total_iterations = args.num_iterations_per_outer_loop * args.D
                     current_iteration = iteration + d * args.num_iterations_per_outer_loop
                     # Annealing the rate if instructed to do so.
                     if args.anneal_lr:
+                    # Calculate total iterations and current iteration
                         frac = 1.0 - (current_iteration - 1.0) / total_iterations
                         lrnow = frac * args.learning_rate
                         optimizer_instance.param_groups[0]["lr"] = lrnow
@@ -653,7 +656,7 @@ def run_subprocess(seed, run_name, args):
                         next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
                         next_obs = torch.Tensor(next_obs_np).to(device)
                         next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
-                        actual_reward = torch.Tensor(actual_reward).to(device).view(-1)
+                        actual_reward = torch.tensor(actual_reward).to(device).view(-1)
 
                         # Use Reward Predictor to estimate rewards or use actual rewards
                         if agent_type == 'Actual':
@@ -754,11 +757,11 @@ def run_subprocess(seed, run_name, args):
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
-                                                    # Force refresh to fix blank lines
-                    corruption_bar.refresh()
-                    outer_loop_bar.refresh()
-                    agent_bar.refresh()
-                    ppo_bar.refresh()
+                    # Force refresh to fix blank lines
+                    # corruption_bar.refresh()
+                    # outer_loop_bar.refresh()
+                    # agent_bar.refresh()
+                    # ppo_bar.refresh()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
@@ -779,6 +782,7 @@ def run_subprocess(seed, run_name, args):
         return expected_returns_this, steps_this, reward_accuracy_this
 
 if __name__ == "__main__":
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sibling_folder = os.path.join(current_dir, '..', 'summary_data')
     if not os.path.exists(sibling_folder):
@@ -800,6 +804,14 @@ if __name__ == "__main__":
     steps_all = {}
     reward_accuracy_all = []
     # agents_eval = {}
+
+
+    profiler = None
+    use_profiler = args.use_profiler
+    if use_profiler: 
+        profiler = cProfile.Profile()
+        profiler.enable()
+
 
 
     num_seeds = args.num_seeds
@@ -830,6 +842,17 @@ if __name__ == "__main__":
             for seed in seed_bar:
                 result = run_subprocess(seed, run_name, args)
                 results.append(result)
+
+    # ! PROFILER HERE
+    if use_profiler: 
+        profiler.disable()
+        s = io.StringIO()
+        sortby = pstats.SortKey.TIME
+        ps = pstats.Stats(profiler, stream=s).sort_stats(sortby)
+        ps.print_stats()
+        profiler.dump_stats(f"./profiles/profile_results_{run_name}.prof")
+        with open(f"./profiles/profile_results_{run_name}.txt", "w") as f:
+            f.write(s.getvalue())
 
     baseline_key = 'Actual cp=0%'
     baseline = []
