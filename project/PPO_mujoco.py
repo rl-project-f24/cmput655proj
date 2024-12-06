@@ -465,9 +465,9 @@ class RewardTrainer:
 
             avg_loss = np.mean(epoch_losses)
             avg_accuracy = np.mean(epoch_accuracies)
-            # if epoch == n_epochs-1:
+            if epoch == n_epochs-1:
             #     print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
-            #     reward_accuracy = avg_accuracy
+                reward_accuracy = avg_accuracy
         return reward_accuracy
 
 

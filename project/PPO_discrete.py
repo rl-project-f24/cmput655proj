@@ -451,9 +451,9 @@ class RewardTrainer:
 
             avg_loss = np.mean(epoch_losses)
             avg_accuracy = np.mean(epoch_accuracies)
-            # if epoch == n_epochs-1:
-            #     print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
-            #     reward_accuracy = avg_accuracy
+            if epoch == n_epochs-1:
+                # print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+                reward_accuracy = avg_accuracy
         return reward_accuracy
 
 
@@ -780,11 +780,11 @@ def run_subprocess(seed, run_name, args):
             # elif agent_type == 'Actual' and cp == 0:
             #     agents_eval_this[key] = copy.deepcopy(agent_actual)
 
-        envs.close()
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        logger.info(f"Seed {seed} DONE!!!!!!!!!!!!!!!!! Execution time: {elapsed_time:.4f} seconds")
-        return expected_returns_this, steps_this, reward_accuracy_this
+    envs.close()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    logger.info(f"Seed {seed} DONE!!!!!!!!!!!!!!!!! Execution time: {elapsed_time:.4f} seconds")
+    return expected_returns_this, steps_this, reward_accuracy_this
 
 if __name__ == "__main__":
 
