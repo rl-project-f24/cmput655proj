@@ -18,6 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.categorical import Categorical
 import matplotlib.pyplot as plt
+import wandb
 
 np.float_ = np.float64
 
@@ -32,7 +33,9 @@ import cProfile
 import pstats
 import io
 
-def monitor_iterations(counter, interval=1, window_size=10):
+
+
+def monitor_iterations(counter, interval=10, window_size=10):
     """Continuously logs iterations per second, running average, and last 10-second average."""
     last_count = 0
     total_elapsed_time = 0  # Keep track of total elapsed time
@@ -546,7 +549,7 @@ def run_subprocess(seed, run_name, args, counter):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     if args.device != "":
         device = torch.device(args.device)
-    logger.info(f"Using device {device}")
+    # logger.info(f"Using device {device}")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
@@ -613,53 +616,80 @@ def run_subprocess(seed, run_name, args, counter):
         next_done = torch.zeros(args.num_envs).to(device)
 
         # for d in range(args.D):
-        outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
-        for d in outer_loop_bar:
-            outer_loop_bar.set_postfix({"Iteration": d + 1})
+        
+        # for d in range(args.D):
             # print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
+        if cp == 0:
 
-            # Collect trajectories
-            use_random_policy = (d == 0)  # Use random policy in the first iteration
-            collector = TrajectoryCollector(
-                lambda: env_fn(),
-                agent=agent_predicted if not use_random_policy else None,
-                num_steps=segment_length,
-                device=device,
-                use_random_policy=use_random_policy,
+            # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
+            # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
+            # agents  = [('Actual', agent_actual, optimizer_actual)]
+            agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
+        else:
+            agents = [('Predicted', agent_predicted, optimizer_predicted)]
+
+            
+        global_step = 0
+
+        agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
+        for agent_type, agent_instance, optimizer_instance in agent_bar:
+            agent_bar.set_postfix({"Agent Type": agent_type})
+
+            global_step = 0
+            assert wandb.run is None
+            run = wandb.init(
+                # set the wandb project where this run will be logged
+                project="PPO_mujooco_clockspeed",
+                group=args.exp_name,  # Group all seeds under the same experiment name
+                # track hyperparameters and run metadata
+                config={
+                "architecture": "PPO_discrete",
+                "run_id": int(time.time()),
+                "env_id": args.env_id,
+                "corruption_percent": cp,
+                "agent_type": agent_type,
+                "batch_size": args.batch_size,
+                "D / Reward training steps": args.D,
+                "total-timesteps_per_iteration": args.total_timesteps_per_iteration,
+                "run_name": run_name,
+                "seed": seed,
+                },
+                reinit=True  # Allows reinitialization in the same process
             )
-            trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories, counter=counter)
-            segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
-            segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
+            # print(run.resumed)
+            outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
+            for d in outer_loop_bar:
+                outer_loop_bar.set_postfix({"Iteration": d + 1})
 
-            # Generate preferences
-            preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
 
-            # Create dataset and dataloader
-            dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
-            dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-            # Train reward predictor
-            # print(f"Seed: {seed} | Training the Reward Predictor...")
-            reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs, counter=counter)
-            reward_accuracy_this_cp.append(reward_accuracy)
+                # Collect trajectories
+                use_random_policy = (d == 0)  # Use random policy in the first iteration
+                collector = TrajectoryCollector(
+                    lambda: env_fn(),
+                    agent=agent_predicted if not use_random_policy else None,
+                    num_steps=segment_length,
+                    device=device,
+                    use_random_policy=use_random_policy,
+                )
+                trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories, counter=counter)
+                segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
+                segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
 
-            # agent_end_of_d_minus_one = copy.deepcopy(agent)
-            # agent_predicted = agent_end_of_d_minus_one
-            # optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
-            # if d == args.D - 1:
-            if cp == 0:
+                # Generate preferences
+                preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
 
-                # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
-                # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
-                # agents  = [('Actual', agent_actual, optimizer_actual)]
-                agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
-            else:
-                agents = [('Predicted', agent_predicted, optimizer_predicted)]
-                global_step = 0
+                # Create dataset and dataloader
+                dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
+                dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+                # Train reward predictor
+                # print(f"Seed: {seed} | Training the Reward Predictor...")
+                reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs, counter=counter)
+                reward_accuracy_this_cp.append(reward_accuracy)
 
-            agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
-            for agent_type, agent_instance, optimizer_instance in agent_bar:
-                agent_bar.set_postfix({"Agent Type": agent_type})
-                # print(f"Seed: {seed} | Training agent on {agent_type} rewards")
+                # agent_end_of_d_minus_one = copy.deepcopy(agent)
+                # agent_predicted = agent_end_of_d_minus_one
+                # optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
+                # if d == args.D - 1:
 
                 # Initialize PPO storage variables
                 obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -805,7 +835,6 @@ def run_subprocess(seed, run_name, args, counter):
                             nn.utils.clip_grad_norm_(agent_instance.parameters(), args.max_grad_norm)
                             optimizer_instance.step()
                             counter["value"] += 1 # good
-
                         if args.target_kl is not None and approx_kl > args.target_kl:
                             break
 
@@ -816,12 +845,34 @@ def run_subprocess(seed, run_name, args, counter):
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma, counter=counter))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
+
+                    wandb.log({
+                        "corruption_percentage": cp,
+                        "agent_type": agent_type,
+                        "iteration": iteration,
+                        "ppo_loss": loss.item(),
+                        "policy_gradient_loss": pg_loss.item(),
+                        "value_function_loss": v_loss.item(),
+                        "entropy_loss": entropy_loss.item(),
+                        "clip_fraction": np.mean(clipfracs),
+                        "approx_kl": approx_kl.item(),
+                        "learning_rate": optimizer_instance.param_groups[0]["lr"],
+                        "expected_return": avg_return,
+                    }, step=global_step)
+                    # print(f"LOGGING STEP {global_step}")
                     # if iteration % 10 == 0:
                     #     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
+                    # Force refresh to fix blank lines
+                    # corruption_bar.refresh()
+                    # outer_loop_bar.refresh()
+                    # agent_bar.refresh()
+                    # ppo_bar.refresh()
+                        # Finish the current run
+            wandb.finish()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
@@ -856,7 +907,7 @@ if __name__ == "__main__":
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations_per_outer_loop = args.total_timesteps_per_iteration // args.batch_size
+    args.num_iterations_per_outer_loop = args.total_timesteps_per_iteration // args.batch_size or 1
     run_name = f"{args.env_id}__{args.exp_name}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 

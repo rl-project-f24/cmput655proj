@@ -170,7 +170,6 @@ class Args:
 
 
 
-
 def episode_trigger(episode_number):
     return False
     # return episode_number % 10 == 0  # Record every 10th episode
@@ -525,6 +524,9 @@ def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
 
 def run_subprocess(seed, run_name, args, counter):
+    # start a new wandb run to track this script
+
+
     eval_flag = args.run_evaluation and seed == evaluation_seed # only evaluate if the seed is the evaluation one
     start_time = time.time()
     # print(f"SEED: {seed} STARTING!!!!!")
@@ -551,8 +553,8 @@ def run_subprocess(seed, run_name, args, counter):
     segment_length = 50  # or any fixed length you prefer
 
     # Define corruption percentages
-    corruption_percentages = [0, 5, 20, 50]
-    # corruption_percentages = [0, 5]
+    # corruption_percentages = [0, 5, 20, 50]
+    corruption_percentages = [0, 5]
 
     corruption_bar = tqdm(corruption_percentages, desc=f"Seed {seed} Corruption", unit="%", leave=False, position=1)
     for cp in corruption_bar:
@@ -611,6 +613,7 @@ def run_subprocess(seed, run_name, args, counter):
         agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
         for agent_type, agent_instance, optimizer_instance in agent_bar:
             agent_bar.set_postfix({"Agent Type": agent_type})
+            print(f"GLOBAL_STEP IS {global_step}")
 
             global_step = 0
             assert wandb.run is None
@@ -812,6 +815,21 @@ def run_subprocess(seed, run_name, args, counter):
                             nn.utils.clip_grad_norm_(agent_instance.parameters(), args.max_grad_norm)
                             optimizer_instance.step()
                             counter["value"] += 1 # good
+                                    # Log metrics to W&B
+                        wandb.log({
+                            "corruption_percentage": cp,
+                            "agent_type": agent_type,
+                            "iteration": iteration,
+                            "ppo_loss": loss.item(),
+                            "policy_gradient_loss": pg_loss.item(),
+                            "value_function_loss": v_loss.item(),
+                            "entropy_loss": entropy_loss.item(),
+                            "clip_fraction": np.mean(clipfracs),
+                            "approx_kl": approx_kl.item(),
+                            "learning_rate": optimizer_instance.param_groups[0]["lr"],
+                            "expected_return": avg_return,
+                        }, step=global_step)
+                        print(f"LOGGING STEP {global_step}")
                         if args.target_kl is not None and approx_kl > args.target_kl:
                             break
 
@@ -822,21 +840,6 @@ def run_subprocess(seed, run_name, args, counter):
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma, counter=counter))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
-
-                    wandb.log({
-                        "corruption_percentage": cp,
-                        "agent_type": agent_type,
-                        "iteration": iteration,
-                        "ppo_loss": loss.item(),
-                        "policy_gradient_loss": pg_loss.item(),
-                        "value_function_loss": v_loss.item(),
-                        "entropy_loss": entropy_loss.item(),
-                        "clip_fraction": np.mean(clipfracs),
-                        "approx_kl": approx_kl.item(),
-                        "learning_rate": optimizer_instance.param_groups[0]["lr"],
-                        "expected_return": avg_return,
-                    }, step=global_step)
-                    # print(f"LOGGING STEP {global_step}")
                     # if iteration % 10 == 0:
                     #     logger.info(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
