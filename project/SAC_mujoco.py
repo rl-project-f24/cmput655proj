@@ -39,9 +39,9 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
-    total_timesteps: int = 10000
+    total_timesteps: int = 9000
     """total timesteps of the experiments, per D iteration"""
-    buffer_size: int = int(1e6)
+    buffer_size: int = int(5e5)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -49,13 +49,13 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 4000
+    learning_starts: int = 3000
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
     """the learning rate of the Q network network optimizer"""
-    policy_frequency: int = 2
+    policy_frequency: int = 4
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
@@ -68,18 +68,18 @@ class Args:
 
 
     # Preferences specific arguments
-    reward_min: int = -10
-    """the min clip of environment reward funciton"""
-    reward_max: int = 10
-    """the max clip of environment reward funciton"""
+    # reward_min: int = -10
+    # """the min clip of environment reward funciton"""
+    # reward_max: int = 10
+    # """the max clip of environment reward funciton"""
     total_timesteps_per_iteration: int = 10000
     """total timesteps per outer loop iteration"""
-    D: int = 3
+    D: int = 4
     """number of outer loop iterations"""
     # Reward predictor specific arguments
-    reward_learning_rate: float = 1e-4
+    reward_learning_rate: float = 3e-5
     """learning rate for the reward predictor"""
-    num_trajectories: int = 200
+    num_trajectories: int = 300
     """number of trajectories to collect for reward predictor training"""
     reward_training_epochs: int = 9
     """number of epochs to train the reward predictor"""
@@ -167,7 +167,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 # Reward Predictor Network
 class RewardPredictorNetwork(nn.Module):
-    def __init__(self, observation_space, action_space, reward_min, reward_max):
+    def __init__(self, observation_space, action_space):
         super().__init__()
         if isinstance(action_space, gym.spaces.Discrete):
             action_dim = action_space.n # one-hot encoded action
@@ -186,8 +186,8 @@ class RewardPredictorNetwork(nn.Module):
         )
         self.sigmoid = nn.Sigmoid()
         self.action_space = action_space
-        self.reward_min = reward_min
-        self.reward_max = reward_max
+        # self.reward_min = reward_min
+        # self.reward_max = reward_max
 
     def forward(self, x, actions):
         # x shape: [batch_size, sequence_length, observation_dim]
@@ -207,12 +207,12 @@ class RewardPredictorNetwork(nn.Module):
 
         x = torch.cat([x, actions_one_hot], dim=-1)  # Concatenate on the last dimension
         x = x.view(-1, obs_dim + action_dim)  # Flatten to [batch_size * sequence_length, obs_dim + action_dim]
-        outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
-        # outputs = self.network(x)  # [batch_size * sequence_length, 1]
-        outputs = self.sigmoid(outputs_original)  # Apply sigmoid
+        outputs = self.network(x)  # [batch_size * sequence_length, 1]
+        # outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
+        # outputs = self.sigmoid(outputs_original)  # Apply sigmoid
         
         # scale the outputs to the desired reward range
-        outputs = outputs * (self.reward_max - self.reward_min) + self.reward_min
+        # outputs = outputs * (self.reward_max - self.reward_min) + self.reward_min
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
         return outputs  # Shape: [batch_size, sequence_length, 1]
@@ -484,9 +484,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    if args.env_id == "InvertedPendulum-v4":
-        args.reward_min = 0
-        args.reward_max = 1
+    # if args.env_id == "InvertedPendulum-v4":
+    #     args.reward_min = 0
+    #     args.reward_max = 1
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -680,7 +680,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         envs.single_observation_space.dtype = np.float32
         
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space, args.reward_min, args.reward_max)
+        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space)
         reward_trainer = RewardTrainer(
             reward_predictor,
             device=device,
