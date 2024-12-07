@@ -7,8 +7,8 @@ import gymnasium as gym
 import torch
 import tyro
 
-from project.evaluate_result_sac import evaluate_in_process, evaluate_result
-from project.SAC_mujoco import Actor
+from project.evaluate_result import evaluate_result
+from project.PPO_discrete import AgentDiscrete, make_env
 
 
 
@@ -17,6 +17,8 @@ from project.SAC_mujoco import Actor
 class Args:
     seed: int = 1
     """Seed of the experiment."""
+    num_envs: int = 1
+    """the number of parallel game environments"""
     cuda: bool = True
     """If toggled, cuda will be enabled by default."""
     env_id: str = "Hopper-v4"
@@ -44,19 +46,6 @@ def load_latest_weights(agent, directory):
     print(f"PPO agent weights loaded from {agent_path}")
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.action_space.seed(seed)
-        return env
-
-    return thunk
-
 
 if __name__ == "__main__":
     # Parse arguments
@@ -69,10 +58,12 @@ if __name__ == "__main__":
         device = torch.device(args.device)
 
     # Set up the environment
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, False, run_name)])
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, False, run_name) for i in range(args.num_envs)] # ! Untested num_envs
+    )
 
     # Initialize the PPO agent
-    agent = Agent(envs).to(device)
+    agent = AgentDiscrete(envs).to(device)
 
     # Load weights for the PPO agent
     try:

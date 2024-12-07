@@ -19,9 +19,11 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.categorical import Categorical
 import matplotlib.pyplot as plt
 
+from project.saved_weight_evaluation.ppo_save_load_weights import save_model_weights
+
 np.float_ = np.float64
 
-from evaluate_result import evaluate_result
+from project.evaluate_result import evaluate_result
 
 import multiprocessing
 from functools import partial
@@ -130,7 +132,9 @@ class Args:
     """Whether to run the profiler and save to local dir after completion"""
     device: str = "" 
     """Device to be used for training"""
-
+    save_model_weights_at_eval: bool = False
+    """Whether to save the model weights to disk at every evaluation step"""
+    
 
 
 
@@ -782,6 +786,10 @@ def run_subprocess(seed, run_name, args):
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
+                    if args.save_model_weights_at_eval:
+                        save_model_weights(agent_instance, directory=f"models/{run_name}/{log_string}", step=global_step)
+
+
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)

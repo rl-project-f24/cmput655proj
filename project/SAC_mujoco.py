@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
 from project.evaluate_result_sac import evaluate_in_process, evaluate_result
-from project.save_load_weights import save_actor_model_weights, save_model_weights
+from project.saved_weight_evaluation.sac_save_load_weights import save_actor_model_weights
 
 
 @dataclass
@@ -652,7 +652,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 if eval_flag:
                     evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
                 if args.save_model_weights_at_eval:
-                    save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{log_string}", step=global_step)
+                    save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{run_name}/{log_string}", step=global_step)
 
                 print(f"Step: {global_step} | Expected Return: {avg_return}")
 
