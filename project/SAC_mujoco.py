@@ -16,6 +16,8 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
+from project.evaluate_result_sac import evaluate_in_process, evaluate_result
+
 
 @dataclass
 class Args:
@@ -83,8 +85,11 @@ class Args:
     """number of trajectories to collect for reward predictor training"""
     reward_training_epochs: int = 9
     """number of epochs to train the reward predictor"""
-
-
+    run_evaluation: bool = False
+    """if toggled, will run the result evaluation including storing video"""
+    device: str = "" 
+    """Device to be used for training"""
+    
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -465,6 +470,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
     args = tyro.cli(Args)
+    eval_flag = args.run_evaluation
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -495,6 +501,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if args.device != "":
+        device = torch.device(args.device)
+
+
+
 
     # env setup
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
@@ -632,6 +643,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 episode_returns.append(avg_return)
                 steps.append(step_count)
                 step_count += args.eval_frequency
+                log_string = f"seed {args.seed}/cp 0/agent_type actual/step {step_count}"
+                if eval_flag:
+                    evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
+
                 print(f"Step: {global_step} | Expected Return: {avg_return}")
 
     envs.close()
@@ -814,6 +829,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                         episode_returns.append(avg_return)
                         steps.append(step_count)
                         step_count += args.eval_frequency
+                        log_string = f"seed {args.seed}/cp {cp}/agent_type preferences/step {step_count}"
+                        if eval_flag:
+                            evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
                         print(f"Step: {global_step} | Expected Return: {avg_return}")
         
         envs.close()
