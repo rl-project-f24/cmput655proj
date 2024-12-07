@@ -82,6 +82,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
+    use_wandb: bool = False
+    """whether to use wandb or not"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
@@ -636,26 +638,27 @@ def run_subprocess(seed, run_name, args, counter):
             agent_bar.set_postfix({"Agent Type": agent_type})
 
             global_step = 0
-            assert wandb.run is None
-            run = wandb.init(
-                # set the wandb project where this run will be logged
-                project="PPO_mujooco_clockspeed",
-                group=args.exp_name,  # Group all seeds under the same experiment name
-                # track hyperparameters and run metadata
-                config={
-                "architecture": "PPO_discrete",
-                "run_id": int(time.time()),
-                "env_id": args.env_id,
-                "corruption_percent": cp,
-                "agent_type": agent_type,
-                "batch_size": args.batch_size,
-                "D / Reward training steps": args.D,
-                "total-timesteps_per_iteration": args.total_timesteps_per_iteration,
-                "run_name": run_name,
-                "seed": seed,
-                },
-                reinit=True  # Allows reinitialization in the same process
-            )
+            if args.use_wandb:
+                assert wandb.run is None
+                run = wandb.init(
+                    # set the wandb project where this run will be logged
+                    project="PPO_mujooco_clockspeed",
+                    group=args.exp_name,  # Group all seeds under the same experiment name
+                    # track hyperparameters and run metadata
+                    config={
+                    "architecture": "PPO_discrete",
+                    "run_id": int(time.time()),
+                    "env_id": args.env_id,
+                    "corruption_percent": cp,
+                    "agent_type": agent_type,
+                    "batch_size": args.batch_size,
+                    "D / Reward training steps": args.D,
+                    "total-timesteps_per_iteration": args.total_timesteps_per_iteration,
+                    "run_name": run_name,
+                    "seed": seed,
+                    },
+                    reinit=True  # Allows reinitialization in the same process
+                )
             # print(run.resumed)
             outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
             for d in outer_loop_bar:
@@ -845,20 +848,20 @@ def run_subprocess(seed, run_name, args, counter):
                     avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma, counter=counter))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
-
-                    wandb.log({
-                        "corruption_percentage": cp,
-                        "agent_type": agent_type,
-                        "iteration": iteration,
-                        "ppo_loss": loss.item(),
-                        "policy_gradient_loss": pg_loss.item(),
-                        "value_function_loss": v_loss.item(),
-                        "entropy_loss": entropy_loss.item(),
-                        "clip_fraction": np.mean(clipfracs),
-                        "approx_kl": approx_kl.item(),
-                        "learning_rate": optimizer_instance.param_groups[0]["lr"],
-                        "expected_return": avg_return,
-                    }, step=global_step)
+                    if args.use_wandb:
+                        wandb.log({
+                            "corruption_percentage": cp,
+                            "agent_type": agent_type,
+                            "iteration": iteration,
+                            "ppo_loss": loss.item(),
+                            "policy_gradient_loss": pg_loss.item(),
+                            "value_function_loss": v_loss.item(),
+                            "entropy_loss": entropy_loss.item(),
+                            "clip_fraction": np.mean(clipfracs),
+                            "approx_kl": approx_kl.item(),
+                            "learning_rate": optimizer_instance.param_groups[0]["lr"],
+                            "expected_return": avg_return,
+                        }, step=global_step)
                     # print(f"LOGGING STEP {global_step}")
                     # if iteration % 10 == 0:
                     #     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
@@ -872,7 +875,8 @@ def run_subprocess(seed, run_name, args, counter):
                     # agent_bar.refresh()
                     # ppo_bar.refresh()
                         # Finish the current run
-            wandb.finish()
+            if args.use_wandb:
+                wandb.finish()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
