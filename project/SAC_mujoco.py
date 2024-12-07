@@ -647,7 +647,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     segment_length = 50  # or any fixed length you prefer
 
     # Define corruption percentages
-    corruption_percentages = [0, 50]
+    corruption_percentages = [0, 20]
     for cp in corruption_percentages:
         print(f"Processing Corruption Percentage: {cp}%")
         # bookeeping for plots
