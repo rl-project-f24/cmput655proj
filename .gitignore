@@ -1,5 +1,7 @@
 # User added
 project/videos
+models/
+project/saved_weight_evaluation/videos/
 
 slurm
 .aim

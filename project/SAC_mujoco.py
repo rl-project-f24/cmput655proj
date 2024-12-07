@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 
 from project.evaluate_result_sac import evaluate_in_process, evaluate_result
+from project.save_load_weights import save_actor_model_weights, save_model_weights
 
 
 @dataclass
@@ -89,6 +90,10 @@ class Args:
     """if toggled, will run the result evaluation including storing video"""
     device: str = "" 
     """Device to be used for training"""
+    save_model_weights_at_eval: bool = False
+    """Whether to save the model weights to disk at every evaluation step"""
+    
+
     
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -646,6 +651,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 log_string = f"seed {args.seed}/cp 0/agent_type actual/step {step_count}"
                 if eval_flag:
                     evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
+                if args.save_model_weights_at_eval:
+                    save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{log_string}", step=global_step)
 
                 print(f"Step: {global_step} | Expected Return: {avg_return}")
 
@@ -832,6 +839,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                         log_string = f"seed {args.seed}/cp {cp}/agent_type preferences/step {step_count}"
                         if eval_flag:
                             evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
+                        if args.save_model_weights_at_eval:
+                            save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{run_name}/{log_string}", step=global_step)
                         print(f"Step: {global_step} | Expected Return: {avg_return}")
         
         envs.close()
@@ -850,3 +859,5 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     plt.show()
 
     writer.close()
+
+
