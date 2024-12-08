@@ -561,7 +561,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     obs, _ = envs.reset(seed=args.seed)
     
     step_count = 0
-    for global_step in range((args.total_timesteps-2*args.eval_frequency) * args.D + 1):
+    max_steps = (args.total_timesteps-2*args.eval_frequency) * args.D + 1
+    for global_step in range(max_steps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -651,7 +652,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 log_string = f"seed {args.seed}/cp 0/agent_type actual/step {step_count}"
                 if eval_flag:
                     evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
-                if args.save_model_weights_at_eval:
+                if args.save_model_weights_at_eval and max_steps - global_step <= args.eval_frequency * 4:
                     save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{log_string}", step=global_step)
 
                 print(f"Step: {global_step} | Expected Return: {avg_return}")
@@ -839,7 +840,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                         log_string = f"seed {args.seed}/cp {cp}/agent_type preferences/step {step_count}"
                         if eval_flag:
                             evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
-                        if args.save_model_weights_at_eval:
+                        if args.save_model_weights_at_eval and args.total_timesteps - global_step <= args.eval_frequency * 4:
                             save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{run_name}/{log_string}", step=global_step)
                         print(f"Step: {global_step} | Expected Return: {avg_return}")
         
