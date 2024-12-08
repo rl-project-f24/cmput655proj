@@ -84,7 +84,7 @@ class Args:
     # Reward predictor specific arguments
     reward_learning_rate: float = 1e-5
     """learning rate for the reward predictor"""
-    num_trajectories: int = 200
+    num_trajectories: int = 250
     """number of trajectories to collect for reward predictor training"""
     reward_training_epochs: int = 9
     """number of epochs to train the reward predictor"""
@@ -474,10 +474,11 @@ class RewardTrainer:
 
 
 
-def expected_return(actor, env_fn, device, seed, num_episodes=10, gamma=0.99):
+def expected_return(actor, env_fn, device, num_episodes=10, gamma=0.99):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
+        seed = np.random.randint(0, 2**16 - 1)
         obs, _ = env.reset(seed=seed)
         done = False
         total_return = 0.0
@@ -531,7 +532,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     #     args.reward_min = 0
     #     args.reward_max = 1
 
-    corruption_percentages = [20]
+    corruption_percentages = [0, 5, 20, 50]
     # bookeeping for plots
     labels = []
     # episode_returns_all = []
@@ -684,7 +685,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                 # evaluate current policy
                 if global_step % args.eval_frequency == 0:
-                    avg_return = np.mean(expected_return(actor, env_fn, device, np.random.randint(0, 2**16 - 1), gamma=args.gamma))
+                    avg_return = np.mean(expected_return(actor, env_fn, device, gamma=args.gamma))
                     episode_returns.append(avg_return)
                     steps.append(step_count)
                     step_count += args.eval_frequency
@@ -878,7 +879,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                         
                         # evaluate current policy
                         if global_step % args.eval_frequency == 0:
-                            avg_return = np.mean(expected_return(actor, env_fn, device, np.random.randint(0, 2**16 - 1), gamma=args.gamma))
+                            avg_return = np.mean(expected_return(actor, env_fn, device, gamma=args.gamma))
                             episode_returns.append(avg_return)
                             steps.append(step_count)
                             step_count += args.eval_frequency
@@ -916,6 +917,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         plt.plot(steps_preference, mean_preference, label=labels[result_idx])
         plt.fill_between(steps_preference, mean_preference - std_preference, mean_preference + std_preference, alpha=0.15)
 
+    plt.xlim(left=0)
+    if args.env_id == 'InvertedPendulum-v4':
+        plt.ylim(bottom=0)
     plt.grid(True, color='gray', alpha=0.3)
     plt.xlabel('Timesteps')
     plt.ylabel('Episode Return')
