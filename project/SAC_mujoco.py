@@ -82,7 +82,7 @@ class Args:
     D: int = 4
     """number of outer loop iterations"""
     # Reward predictor specific arguments
-    reward_learning_rate: float = 1e-5
+    reward_learning_rate: float = 3e-5
     """learning rate for the reward predictor"""
     num_trajectories: int = 250
     """number of trajectories to collect for reward predictor training"""
@@ -698,14 +698,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     print(f"Step: {global_step} | Expected Return: {avg_return}")
 
         envs.close()
-        # episode_returns_all.append(episode_returns)
         if seed_idx == 0:
             steps_base = steps.copy()
-            # labels.append('SAC with task reward')
         results_base.append(episode_returns.copy())
-
-        
-        # plt.fill_between(steps_all['Predicted cp=0%'], mean_values - std_values, mean_values + std_values, alpha=0.15)
 
         # PREFERENCES
         segment_length = 50  # or any fixed length you prefer
