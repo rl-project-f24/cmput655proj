@@ -99,7 +99,7 @@ class Args:
     # Reward predictor specific arguments
     reward_learning_rate: float = 1e-4
     """learning rate for the reward predictor"""
-    num_trajectories: int = 100
+    num_trajectories: int = 125
     """number of trajectories to collect for reward predictor training"""
     # num_preferences: int = 300
     # """number of preference comparisons to generate"""
@@ -413,12 +413,13 @@ class RewardTrainer:
 
         return preferences
 
-    def train_on_dataloader(self, dataloader, n_epochs=1):
-        reward_accuracy = 0
+    def train_on_dataloader(self, train_dataloader, val_dataloader=None, n_epochs=1):
+        best_val_accuracy = 0.0
         for epoch in range(n_epochs):
+            self.predictor.train()
             epoch_losses = []
             epoch_accuracies = []
-            for s1, a1, s2, a2, prefs in dataloader:
+            for s1, a1, s2, a2, prefs in train_dataloader:
                 s1 = s1.to(self.device)
                 s2 = s2.to(self.device)
                 a1 = a1.to(self.device)
@@ -454,11 +455,41 @@ class RewardTrainer:
                 epoch_accuracies.append(accuracy.item())
 
             avg_loss = np.mean(epoch_losses)
-            avg_accuracy = np.mean(epoch_accuracies)
-            if epoch == n_epochs-1:
-                # print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
-                reward_accuracy = avg_accuracy
-        return reward_accuracy
+            avg_train_accuracy = np.mean(epoch_accuracies)
+
+            if val_dataloader is not None:
+                self.predictor.eval()
+                val_accuracies = []
+                with torch.no_grad():
+                    for s1, a1, s2, a2, prefs in val_dataloader:
+                        s1 = s1.to(self.device)
+                        s2 = s2.to(self.device)
+                        a1 = a1.to(self.device)
+                        a2 = a2.to(self.device)
+                        prefs = prefs.to(self.device)
+
+                        r1 = self.predictor(s1, a1).squeeze(-1)
+                        r2 = self.predictor(s2, a2).squeeze(-1)
+                        r1_sum = r1.sum(dim=1)
+                        r2_sum = r2.sum(dim=1)
+                        logits = torch.stack([r1_sum, r2_sum], dim=1)
+                        
+                        predictions = logits.argmax(dim=1)
+                        targets = prefs.argmax(dim=1)
+                        accuracy = (predictions == targets).float().mean().item()
+                        val_accuracies.append(accuracy)
+
+                avg_val_accuracy = np.mean(val_accuracies)
+                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}, Val Acc: {avg_val_accuracy:.4f}")
+                if avg_val_accuracy > best_val_accuracy:
+                    best_val_accuracy = avg_val_accuracy
+            else:
+                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}")
+            # if epoch == n_epochs-1:
+            #     # print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            #     reward_accuracy = avg_accuracy
+        # return reward_accuracy
+        return best_val_accuracy if val_dataloader is not None else avg_train_accuracy
 
 
 def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99):
@@ -582,10 +613,15 @@ def run_subprocess(seed, run_name, args):
 
             # Create dataset and dataloader
             dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
-            dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+            train_size = int(0.8 * len(dataset))
+            val_size = len(dataset) - train_size
+            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+            train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+            val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
             # Train reward predictor
             # print(f"Seed: {seed} | Training the Reward Predictor...")
-            reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs)
+            reward_accuracy = reward_trainer.train_on_dataloader(train_dataloader, val_dataloader, n_epochs=args.reward_training_epochs)
             reward_accuracy_this_cp.append(reward_accuracy)
 
             # agent_end_of_d_minus_one = copy.deepcopy(agent)
