@@ -67,7 +67,7 @@ class Args:
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 3e-5
+    learning_rate: float = 1e-5
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -99,9 +99,9 @@ class Args:
     """the target KL divergence threshold"""
 
     # Reward predictor specific arguments
-    reward_learning_rate: float = 1e-4
+    reward_learning_rate: float = 3e-5
     """learning rate for the reward predictor"""
-    num_trajectories: int = 100
+    num_trajectories: int = 200
     """number of trajectories to collect for reward predictor training"""
     # num_preferences: int = 1000
     # """number of preference comparisons to generate"""
