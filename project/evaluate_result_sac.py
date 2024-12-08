@@ -104,5 +104,5 @@ def evaluate_result(agent_key, agent_instance, run_name, device, args, log_strin
         for agent, rewards in eval_rewards.items():
             f.write(f"{agent} total episodic rewards: {rewards}\n")
         f.write("\n")
-    print(f"Evaluation videos and rewards saved to {video_folder}/")
+    print(f"Evaluation videos and rewards saved to {os.path.abspath(video_folder)}/")
 

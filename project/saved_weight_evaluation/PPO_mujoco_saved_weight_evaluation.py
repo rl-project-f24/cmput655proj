@@ -7,8 +7,8 @@ import gymnasium as gym
 import torch
 import tyro
 
-from project.evaluate_result_sac import evaluate_in_process, evaluate_result
-from project.SAC_mujoco import Actor
+from project.evaluate_result import evaluate_result
+from project.PPO_mujoco import Agent
 
 
 
