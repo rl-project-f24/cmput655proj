@@ -1,0 +1,959 @@
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+import os
+import random
+import time
+from dataclasses import dataclass
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import tyro
+from torch.utils.data import Dataset, DataLoader
+from stable_baselines3.common.atari_wrappers import (
+    ClipRewardEnv,
+    EpisodicLifeEnv,
+    MaxAndSkipEnv,
+)
+from stable_baselines3.common.buffers import ReplayBuffer
+from torch.distributions.categorical import Categorical
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+
+from project.evaluate_result_sac import evaluate_in_process, evaluate_result
+from project.saved_weight_evaluation.sac_save_load_weights import save_actor_model_weights
+
+
+@dataclass
+class Args:
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    """the name of this experiment"""
+    seed: int = 1
+    """seed of the experiment"""
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "cleanRL"
+    """the wandb's project name"""
+    wandb_entity: str = None
+    """the entity (team) of wandb's project"""
+    capture_video: bool = False
+    """whether to capture videos of the agent performances (check out `videos` folder)"""
+
+    # Algorithm specific arguments
+    env_id: str = "BeamRiderNoFrameskip-v4"
+    """the environment id of the task"""
+    total_timesteps: int = 9000
+    """total timesteps of the experiments, per D iteration"""
+    buffer_size: int = int(5e5)
+    """the replay memory buffer size"""
+    gamma: float = 0.99
+    """the discount factor gamma"""
+    tau: float = 0.005
+    """target smoothing coefficient (default: 0.005)"""
+    batch_size: int = 256
+    """the batch size of sample from the reply memory"""
+    learning_starts: int = 3000
+    """timestep to start learning"""
+    policy_lr: float = 3e-4
+    """the learning rate of the policy network optimizer"""
+    q_lr: float = 1e-3
+    """the learning rate of the Q network network optimizer"""
+    update_frequency: int = 4
+    """the frequency of training updates"""
+    target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
+    """the frequency of updates for the target nerworks"""
+    alpha: float = 0.2
+    """Entropy regularization coefficient."""
+    autotune: bool = True
+    """automatic tuning of the entropy coefficient"""
+    target_entropy_scale: float = 0.89
+    """coefficient for scaling the autotune entropy target"""
+    eval_frequency: int = 500
+    """the frequency of evaluating the policy (delayed)"""
+
+
+    # Preferences specific arguments
+    num_seeds: int = 1
+    """number of seeds to run everythhing"""
+    D: int = 4
+    """number of outer loop iterations"""
+    # Reward predictor specific arguments
+    reward_learning_rate: float = 3e-5
+    """learning rate for the reward predictor"""
+    num_trajectories: int = 250
+    """number of trajectories to collect for reward predictor training"""
+    reward_training_epochs: int = 9
+    """number of epochs to train the reward predictor"""
+    run_evaluation: bool = False
+    """if toggled, will run the result evaluation including storing video"""
+    device: str = "" 
+    """Device to be used for training"""
+    save_model_weights_at_eval: bool = False
+    """Whether to save the model weights to disk at every evaluation step"""
+    
+
+    
+def make_env(env_id, seed, idx, capture_video, run_name):
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.action_space.seed(seed)
+        return env
+
+    return thunk
+
+def layer_init_sac(layer, bias_const=0.0):
+    nn.init.kaiming_normal_(layer.weight)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+# ALGO LOGIC: initialize agent here:
+# NOTE: Sharing a CNN encoder between Actor and Critics is not recommended for SAC without stopping actor gradients
+# See the SAC+AE paper https://arxiv.org/abs/1910.01741 for more info
+# TL;DR The actor's gradients mess up the representation when using a joint encoder
+class SoftQNetwork(nn.Module):
+    def __init__(self, envs):
+        super().__init__()
+        obs_shape = envs.single_observation_space.shape
+        hidden_size = 128
+        self.conv = nn.Sequential(
+            layer_init_sac(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size//2)),
+            nn.ReLU(),
+            layer_init_sac(nn.Linear(hidden_size//2, hidden_size)),
+            nn.ReLU(),
+            layer_init_sac(nn.Linear(hidden_size, hidden_size)),
+            nn.Flatten(),
+        )
+
+        with torch.inference_mode():
+            output_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
+
+        self.fc1 = layer_init_sac(nn.Linear(output_dim, 512))
+        self.fc_q = layer_init_sac(nn.Linear(512, envs.single_action_space.n))
+
+    def forward(self, x):
+        x = F.relu(self.conv(x / 255.0))
+        x = F.relu(self.fc1(x))
+        q_vals = self.fc_q(x)
+        return q_vals
+
+
+class Actor(nn.Module):
+    def __init__(self, envs):
+        super().__init__()
+        obs_shape = envs.single_observation_space.shape
+        hidden_size = 128
+        self.conv = nn.Sequential(
+            layer_init_sac(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size//2)),
+            nn.ReLU(),
+            layer_init_sac(nn.Linear(hidden_size//2, hidden_size)),
+            nn.ReLU(),
+            layer_init_sac(nn.Linear(hidden_size, hidden_size)),
+            nn.Flatten(),
+        )
+
+        with torch.inference_mode():
+            output_dim = self.conv(torch.zeros(1, *obs_shape)).shape[1]
+
+        self.fc1 = layer_init_sac(nn.Linear(output_dim, 512))
+        self.fc_logits = layer_init_sac(nn.Linear(512, envs.single_action_space.n))
+
+    def forward(self, x):
+        x = F.relu(self.conv(x))
+        x = F.relu(self.fc1(x))
+        logits = self.fc_logits(x)
+
+        return logits
+
+    def get_action(self, x):
+        logits = self(x / 255.0)
+        policy_dist = Categorical(logits=logits)
+        action = policy_dist.sample()
+        # Action probabilities for calculating the adapted soft-Q loss
+        action_probs = policy_dist.probs
+        log_prob = F.log_softmax(logits, dim=1)
+        return action, log_prob, action_probs
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+# Reward Predictor Network
+class RewardPredictorNetwork(nn.Module):
+    def __init__(self, observation_space, action_space):
+        super().__init__()
+        if isinstance(action_space, gym.spaces.Discrete):
+            action_dim = action_space.n # one-hot encoded action
+        else:
+            action_dim = np.prod(action_space.shape)
+        input_dim = np.prod(observation_space.shape) + action_dim
+        hidden_size = 256
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(input_dim, hidden_size)),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden_size, 1)),
+        )
+        self.sigmoid = nn.Sigmoid()
+        self.action_space = action_space
+        # self.reward_min = reward_min
+        # self.reward_max = reward_max
+
+    def forward(self, x, actions):
+        # x shape: [batch_size, sequence_length, observation_dim]
+        # actions shape: [batch_size, sequence_length]
+        batch_size, sequence_length, obs_dim = x.shape
+
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            num_actions = self.action_space.n
+            actions = actions.long().view(-1)  # Flatten to [batch_size * sequence_length]
+            actions_one_hot = torch.nn.functional.one_hot(actions, num_classes=num_actions).float()
+            actions_one_hot = actions_one_hot.view(batch_size, sequence_length, -1)
+            action_dim = num_actions
+        else:
+            action_dim = self.action_space.shape[0]
+            actions = actions.view(batch_size, sequence_length, action_dim)
+            actions_one_hot = actions
+
+        x = torch.cat([x, actions_one_hot], dim=-1)  # Concatenate on the last dimension
+        x = x.view(-1, obs_dim + action_dim)  # Flatten to [batch_size * sequence_length, obs_dim + action_dim]
+        outputs = self.network(x)  # [batch_size * sequence_length, 1]
+        # outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
+        # outputs = self.sigmoid(outputs_original)  # Apply sigmoid
+        
+        # scale the outputs to the desired reward range
+        # outputs = outputs * (self.reward_max - self.reward_min) + self.reward_min
+
+        outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
+        return outputs  # Shape: [batch_size, sequence_length, 1]
+
+
+# Dataset for preference comparisons
+class PreferenceDataset(Dataset):
+    def __init__(self, segments0, segments1, preferences, segment_length):
+        self.segments0 = segments0
+        self.segments1 = segments1
+        self.preferences = preferences
+        self.segment_length = segment_length
+
+    def __len__(self):
+        return len(self.preferences)
+
+    def __getitem__(self, idx):
+        seg1_id, seg2_id, pref = self.preferences[idx]
+        seg1_obs = self.pad_or_truncate(self.segments0[seg1_id][0])
+        seg1_actions = self.pad_or_truncate_actions(self.segments0[seg1_id][1])
+        seg2_obs = self.pad_or_truncate(self.segments1[seg2_id][0])
+        seg2_actions = self.pad_or_truncate_actions(self.segments1[seg2_id][1])
+        return (
+            torch.FloatTensor(seg1_obs),
+            torch.FloatTensor(seg1_actions),
+            torch.FloatTensor(seg2_obs),
+            torch.FloatTensor(seg2_actions),
+            torch.FloatTensor(pref),
+        )
+
+    def pad_or_truncate(self, segment):
+        length = len(segment)
+        if length < self.segment_length:
+            # Pad with zeros
+            pad_size = self.segment_length - length
+            padding = np.zeros((pad_size, *segment.shape[1:]))
+            segment = np.concatenate([segment, padding], axis=0)
+        else:
+            # Truncate to the fixed length
+            segment = segment[:self.segment_length]
+        return segment
+
+    def pad_or_truncate_actions(self, actions):
+        length = len(actions)
+        if length < self.segment_length:
+            # Pad with zeros
+            pad_size = self.segment_length - length
+            if isinstance(actions[0], np.integer):
+                padding = np.zeros(pad_size, dtype=np.int64)
+            else: 
+                padding = np.zeros((pad_size, *actions.shape[1:]))
+            actions = np.concatenate([actions, padding], axis=0)
+        else:
+            # Truncate to the fixed length
+            actions = actions[:self.segment_length]
+        return actions
+
+# Trajectory Collector
+class TrajectoryCollector:
+    def __init__(self, env_fn, agent=None, num_steps=50, device='cpu', use_random_policy=False):
+        self.env_fn = env_fn
+        self.agent = agent
+        self.num_steps = num_steps
+        self.device = device
+        self.use_random_policy = use_random_policy
+
+    def collect_trajectory(self):
+        # collect 2 trajectories with the same start
+        env = self.env_fn()
+        states0, states1 = [], []
+        actions0, actions1 = [], []
+        
+        seed = np.random.randint(0, 2**16 - 1)
+        
+        # trajectory 0
+        obs, _ = env.reset(seed=seed) # start state, shared by both trajectories
+        total_reward0 = 0
+        states0.append(obs)
+        if not self.use_random_policy:
+            obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+
+        for _ in range(self.num_steps):
+            if self.use_random_policy:
+                action = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    action, _, _ = self.agent.get_action(obs_tensor)
+                action = action.cpu().numpy()[0]
+            actions0.append(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            states0.append(obs)
+            total_reward0 += reward
+            if terminated or truncated:
+                break
+            if not self.use_random_policy:
+                obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+
+        # trajectory 1
+        obs, _ = env.reset(seed=seed) # start state, shared by both trajectories
+        total_reward1 = 0
+        states1.append(obs)
+        if not self.use_random_policy:
+            obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+
+        for _ in range(self.num_steps):
+            if self.use_random_policy:
+                action = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    action, _, _ = self.agent.get_action(obs_tensor)
+                action = action.cpu().numpy()[0]
+            actions1.append(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            states1.append(obs)
+            total_reward1 += reward
+            if terminated or truncated:
+                break
+            if not self.use_random_policy:
+                obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+
+        env.close()
+        return np.array(states0), total_reward0, np.array(actions0), np.array(states1), total_reward1, np.array(actions1)
+
+    def collect_trajectories(self, n_trajectories):
+        trajectories0 = {}
+        trajectories1 = {}
+        for i in range(n_trajectories):
+            states0, reward0, actions0, states1, reward1, actions1 = self.collect_trajectory()
+            trajectories0[i] = (states0, actions0, reward0)
+            trajectories1[i] = (states1, actions1, reward1)
+        return trajectories0, trajectories1
+
+
+# Reward Trainer
+class RewardTrainer:
+    def __init__(self, predictor, device="cpu", lr=1e-4, corruption_percentage=0.0):
+        self.predictor = predictor.to(device)
+        self.optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
+        self.device = device
+        self.corruption_percentage = corruption_percentage / 100.0  # Convert percentage to probability
+
+    def generate_preferences(self, trajectories0, trajectories1, n_preferences):
+        preferences = []
+        # traj_ids = list(trajectories0.keys())
+
+        for i in range(n_preferences):
+            # i = np.random.choice(traj_ids, size=1, replace=True)[0]
+            reward_i = trajectories0[i][2]
+            reward_j = trajectories1[i][2]
+
+            if reward_i - reward_j > 0:
+                pref = [1.0, -1.0]
+            elif reward_i - reward_j < 0:
+                pref = [-1.0, 1.0]
+            else:
+                pref = [0, 0]
+
+            # Apply corruption
+            if np.random.rand() < self.corruption_percentage:
+                pref = [pref[1], pref[0]]  # Swap preferences
+            # if np.random.rand() < self.corruption_percentage:
+            #     if np.random.rand() < 0.5:
+            #         pref = [pref[1], pref[0]]  # Swap preferences
+            #     else:
+            #         pref = [pref[0], pref[1]]
+
+            preferences.append((i, i, pref))
+
+        return preferences
+
+    def train_on_dataloader(self, train_dataloader, val_dataloader=None, n_epochs=1):
+        best_val_accuracy = 0.0
+        for epoch in range(n_epochs):
+            self.predictor.train()
+            epoch_losses = []
+            epoch_accuracies = []
+            for s1, a1, s2, a2, prefs in train_dataloader:
+                s1 = s1.to(self.device)
+                s2 = s2.to(self.device)
+                a1 = a1.to(self.device)
+                a2 = a2.to(self.device)
+                prefs = prefs.to(self.device)
+
+                # Get predicted rewards
+                r1 = self.predictor(s1, a1).squeeze(-1)  # shape: [batch_size, sequence_length]
+                r2 = self.predictor(s2, a2).squeeze(-1)
+
+                # Sum over time steps
+                r1_sum = r1.sum(dim=1)  # shape: [batch_size]
+                r2_sum = r2.sum(dim=1)
+
+                # Stack for softmax
+                logits = torch.stack([r1_sum, r2_sum], dim=1)  # shape: [batch_size, 2]
+
+                # Calculate loss
+                loss = nn.functional.cross_entropy(logits, prefs.argmax(dim=1))
+
+                # Optimize
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                # Calculate accuracy
+                with torch.no_grad():
+                    predictions = logits.argmax(dim=1)
+                    targets = prefs.argmax(dim=1)
+                    accuracy = (predictions == targets).float().mean()
+
+                epoch_losses.append(loss.item())
+                epoch_accuracies.append(accuracy.item())
+
+            avg_loss = np.mean(epoch_losses)
+            avg_train_accuracy = np.mean(epoch_accuracies)
+            if val_dataloader is not None:
+                self.predictor.eval()
+                val_accuracies = []
+                with torch.no_grad():
+                    for s1, a1, s2, a2, prefs in val_dataloader:
+                        s1 = s1.to(self.device)
+                        s2 = s2.to(self.device)
+                        a1 = a1.to(self.device)
+                        a2 = a2.to(self.device)
+                        prefs = prefs.to(self.device)
+
+                        r1 = self.predictor(s1, a1).squeeze(-1)
+                        r2 = self.predictor(s2, a2).squeeze(-1)
+                        r1_sum = r1.sum(dim=1)
+                        r2_sum = r2.sum(dim=1)
+                        logits = torch.stack([r1_sum, r2_sum], dim=1)
+                        
+                        predictions = logits.argmax(dim=1)
+                        targets = prefs.argmax(dim=1)
+                        accuracy = (predictions == targets).float().mean().item()
+                        val_accuracies.append(accuracy)
+
+                avg_val_accuracy = np.mean(val_accuracies)
+                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}, Val Acc: {avg_val_accuracy:.4f}")
+                if avg_val_accuracy > best_val_accuracy:
+                    best_val_accuracy = avg_val_accuracy
+            else:
+                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}")
+            # if epoch == n_epochs-1:
+            #     # print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            #     reward_accuracy = avg_accuracy
+        # return reward_accuracy
+        return best_val_accuracy if val_dataloader is not None else avg_train_accuracy
+
+
+
+def expected_return(actor, env_fn, device, num_episodes=10, gamma=0.99):
+    returns = []
+    for _ in range(num_episodes):
+        env = env_fn()
+        seed = np.random.randint(0, 2**16 - 1)
+        obs, _ = env.reset(seed=seed)
+        done = False
+        total_return = 0.0
+        # discount = 1.0
+        while not done:
+            obs_tensor = torch.Tensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action, _, _ = actor.get_action(obs_tensor)
+            action = action.cpu().numpy()[0]
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_return += reward
+            # discount *= gamma
+            done = terminated or truncated
+        returns.append(total_return)
+        env.close()
+    return returns  # Return list of returns for each episode
+
+
+if __name__ == "__main__":
+    import stable_baselines3 as sb3
+
+    if sb3.__version__ < "2.0":
+        raise ValueError(
+            """Ongoing migration: run the following command to install the new dependencies:
+poetry run pip install "stable_baselines3==2.0.0a1"
+"""
+        )
+
+    args = tyro.cli(Args)
+    eval_flag = args.run_evaluation
+    run_name = f"{args.env_id}__{args.exp_name}__{int(time.time())}"
+    if args.track:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+
+    # if args.env_id == "InvertedPendulum-v4":
+    #     args.reward_min = 0
+    #     args.reward_max = 1
+
+    corruption_percentages = [0, 5, 20, 50]
+    # bookeeping for plots
+    labels = []
+    # episode_returns_all = []
+
+    num_seeds = args.num_seeds
+    seeds = list(range(num_seeds))
+    results_base = []
+    steps_base = []
+    results_preference = [[] for _ in corruption_percentages]
+    steps_preference = []
+
+    for seed_idx, seed in enumerate(seeds):
+        print(f"SEED: {seed} STARTING!!!!!")
+        # TRY NOT TO MODIFY: seeding
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.backends.cudnn.deterministic = args.torch_deterministic
+
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        if args.device != "":
+            device = torch.device(args.device)
+
+
+        # env setup
+        envs = gym.vector.SyncVectorEnv([make_env(args.env_id, seed, 0, args.capture_video, run_name)])
+        env_fn = lambda: make_env(args.env_id, seed, 0, args.capture_video, run_name)()
+        assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+        actor = Actor(envs).to(device)
+        qf1 = SoftQNetwork(envs).to(device)
+        qf2 = SoftQNetwork(envs).to(device)
+        qf1_target = SoftQNetwork(envs).to(device)
+        qf2_target = SoftQNetwork(envs).to(device)
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+         # TRY NOT TO MODIFY: eps=1e-4 increases numerical stability
+        q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, eps=1e-4)
+        actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, eps=1e-4)
+
+        # Automatic entropy tuning
+        if args.autotune:
+            target_entropy = -args.target_entropy_scale * torch.log(1 / torch.tensor(envs.single_action_space.n))
+            log_alpha = torch.zeros(1, requires_grad=True, device=device)
+            alpha = log_alpha.exp().item()
+            a_optimizer = optim.Adam([log_alpha], lr=args.q_lr, eps=1e-4)
+        else:
+            alpha = args.alpha
+
+        rb = ReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            handle_timeout_termination=False,
+        )
+        start_time = time.time()
+
+        # ACTUAL
+        episode_returns = []
+        steps = []
+
+        # TRY NOT TO MODIFY: start the game
+        obs, _ = envs.reset(seed=seed)
+        
+        step_count = 0
+        max_steps = (args.total_timesteps-args.eval_frequency) * args.D + 1
+        for global_step in range(max_steps):
+            # ALGO LOGIC: put action logic here
+            if global_step < args.learning_starts:
+                actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            else:
+                actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+                actions = actions.detach().cpu().numpy()
+
+            # TRY NOT TO MODIFY: execute the game and log data.
+            next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+
+            # TRY NOT TO MODIFY: record rewards for plotting purposes
+            # if "final_info" in infos:
+            #     for info in infos["final_info"]:
+            #         # Skip the envs that are not done
+            #         if "episode" not in info:
+            #             continue
+            #         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            #         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+            #         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+            #         break
+
+            # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+            real_next_obs = next_obs.copy()
+            for idx, trunc in enumerate(truncations):
+                if trunc:
+                    real_next_obs[idx] = infos["final_observation"][idx]
+            rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+
+            # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+            obs = next_obs
+
+            # ALGO LOGIC: training.
+            if global_step >= args.learning_starts:
+                if global_step % args.update_frequency == 0:
+                    data = rb.sample(args.batch_size)
+                    # CRITIC training
+                    with torch.no_grad():
+                        _, next_state_log_pi, next_state_action_probs = actor.get_action(data.next_observations)
+                        qf1_next_target = qf1_target(data.next_observations)
+                        qf2_next_target = qf2_target(data.next_observations)
+                        # we can use the action probabilities instead of MC sampling to estimate the expectation
+                        min_qf_next_target = next_state_action_probs * (
+                            torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                        )
+                        # adapt Q-target for discrete Q-function
+                        min_qf_next_target = min_qf_next_target.sum(dim=1)
+                        next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target)
+
+                    # use Q-values only for the taken actions
+                    qf1_values = qf1(data.observations)
+                    qf2_values = qf2(data.observations)
+                    qf1_a_values = qf1_values.gather(1, data.actions.long()).view(-1)
+                    qf2_a_values = qf2_values.gather(1, data.actions.long()).view(-1)
+                    qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                    qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                    qf_loss = qf1_loss + qf2_loss
+
+                    # optimize the model
+                    q_optimizer.zero_grad()
+                    qf_loss.backward()
+                    q_optimizer.step()
+
+                    # ACTOR training
+                    _, log_pi, action_probs = actor.get_action(data.observations)
+                    with torch.no_grad():
+                        qf1_values = qf1(data.observations)
+                        qf2_values = qf2(data.observations)
+                        min_qf_values = torch.min(qf1_values, qf2_values)
+                    # no need for reparameterization, the expectation can be calculated for discrete actions
+                    actor_loss = (action_probs * ((alpha * log_pi) - min_qf_values)).mean()
+
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
+
+                    if args.autotune:
+                        # re-use action probabilities for temperature loss
+                        alpha_loss = (action_probs.detach() * (-log_alpha.exp() * (log_pi + target_entropy).detach())).mean()
+
+                        a_optimizer.zero_grad()
+                        alpha_loss.backward()
+                        a_optimizer.step()
+                        alpha = log_alpha.exp().item()
+
+                # update the target networks
+                if global_step % args.target_network_frequency == 0:
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+                # evaluate current policy
+                if global_step % args.eval_frequency == 0:
+                    avg_return = np.mean(expected_return(actor, env_fn, device, gamma=args.gamma))
+                    episode_returns.append(avg_return)
+                    steps.append(step_count)
+                    step_count += args.eval_frequency
+                    log_string = f"seed {seed}/cp 0/agent_type actual/step {step_count}"
+                    if eval_flag:
+                        evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
+                    if args.save_model_weights_at_eval and seed == 0 and max_steps - global_step <= args.eval_frequency * 4:
+                        save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{run_name}/{log_string}", step=global_step)
+
+                    print(f"Step: {global_step} | Expected Return: {avg_return}")
+
+        envs.close()
+        if seed_idx == 0:
+            steps_base = steps.copy()
+        results_base.append(episode_returns.copy())
+
+        # PREFERENCES
+        segment_length = 50  # or any fixed length you prefer
+
+        # Define corruption percentages
+        for cp_idx, cp in enumerate(corruption_percentages):
+            print(f"Processing Corruption Percentage: {cp}%")
+            # bookeeping for plots
+            episode_returns = []
+            steps = []
+            # env setup
+            envs = gym.vector.SyncVectorEnv([make_env(args.env_id, seed, 0, args.capture_video, run_name)])
+            assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+            actor = Actor(envs).to(device)
+            qf1 = SoftQNetwork(envs).to(device)
+            qf2 = SoftQNetwork(envs).to(device)
+            qf1_target = SoftQNetwork(envs).to(device)
+            qf2_target = SoftQNetwork(envs).to(device)
+            qf1_target.load_state_dict(qf1.state_dict())
+            qf2_target.load_state_dict(qf2.state_dict())
+            # TRY NOT TO MODIFY: eps=1e-4 increases numerical stability
+            q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, eps=1e-4)
+            actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, eps=1e-4)
+
+            # Automatic entropy tuning
+            if args.autotune:
+                target_entropy = -args.target_entropy_scale * torch.log(1 / torch.tensor(envs.single_action_space.n))
+                log_alpha = torch.zeros(1, requires_grad=True, device=device)
+                alpha = log_alpha.exp().item()
+                a_optimizer = optim.Adam([log_alpha], lr=args.q_lr, eps=1e-4)
+            else:
+                alpha = args.alpha
+            
+            reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space)
+            reward_trainer = RewardTrainer(
+                reward_predictor,
+                device=device,
+                lr=args.reward_learning_rate,
+                corruption_percentage=cp,
+            )
+            step_count = 0
+            for d in range(args.D):
+                print(f"Outer iteration {d}/{args.D}")
+                # Recollect data
+                rb = ReplayBuffer(
+                    args.buffer_size,
+                    envs.single_observation_space,
+                    envs.single_action_space,
+                    device,
+                    handle_timeout_termination=False,
+                )
+
+                # Collect trajectories
+                use_random_policy = (d == 0)  # Use random policy in the first iteration
+                collector = TrajectoryCollector(
+                    lambda: env_fn(),
+                    agent=actor if not use_random_policy else None,
+                    num_steps=segment_length,
+                    device=device,
+                    use_random_policy=use_random_policy,
+                )
+                trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories)
+                segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
+                segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
+
+                # Generate preferences
+                preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
+
+                # Create dataset and dataloader
+                dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
+                train_size = int(0.8 * len(dataset))
+                val_size = len(dataset) - train_size
+                train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+
+                train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+                # Train reward predictor
+                # print("Training the Reward Predictor...")
+                reward_accuracy = reward_trainer.train_on_dataloader(train_dataloader, val_dataloader, n_epochs=args.reward_training_epochs)
+
+                obs, _ = envs.reset(seed=seed)
+                for global_step in range(args.total_timesteps+1):
+                    # ALGO LOGIC: put action logic here
+                    if global_step < args.learning_starts:
+                        actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+                    else:
+                        actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+                        actions = actions.detach().cpu().numpy()
+
+                    # TRY NOT TO MODIFY: execute the game and log data.
+                    prev_obs = torch.Tensor(obs).to(device)
+                    next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+                    with torch.no_grad():
+                        actions_tensor = torch.Tensor(actions).to(device)
+                        predicted_reward = reward_predictor(prev_obs.unsqueeze(1), actions_tensor.unsqueeze(1)).squeeze(-1).squeeze(-1)
+
+                    # TRY NOT TO MODIFY: record rewards for plotting purposes
+                    # if "final_info" in infos:
+                    #     for info in infos["final_info"]:
+                    #         # Skip the envs that are not done
+                    #         if "episode" not in info:
+                    #             continue
+                    #         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                    #         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                    #         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    #         break
+
+                    # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+                    real_next_obs = next_obs.copy()
+                    for idx, trunc in enumerate(truncations):
+                        if trunc:
+                            real_next_obs[idx] = infos["final_observation"][idx]
+                    rb.add(obs, real_next_obs, actions, predicted_reward, terminations, infos)
+
+                    # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+                    obs = next_obs
+
+                    # ALGO LOGIC: training.
+                    if global_step >= args.learning_starts:
+                        if global_step % args.update_frequency == 0:
+                            data = rb.sample(args.batch_size)
+                            with torch.no_grad():
+                                _, next_state_log_pi, next_state_action_probs = actor.get_action(data.next_observations)
+                                qf1_next_target = qf1_target(data.next_observations)
+                                qf2_next_target = qf2_target(data.next_observations)
+                                # we can use the action probabilities instead of MC sampling to estimate the expectation
+                                min_qf_next_target = next_state_action_probs * (
+                                    torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                                )
+                                # adapt Q-target for discrete Q-function
+                                min_qf_next_target = min_qf_next_target.sum(dim=1)
+                                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target)
+
+                            # use Q-values only for the taken actions
+                            qf1_values = qf1(data.observations)
+                            qf2_values = qf2(data.observations)
+                            qf1_a_values = qf1_values.gather(1, data.actions.long()).view(-1)
+                            qf2_a_values = qf2_values.gather(1, data.actions.long()).view(-1)
+                            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                            qf_loss = qf1_loss + qf2_loss
+
+                            # optimize the model
+                            q_optimizer.zero_grad()
+                            qf_loss.backward()
+                            q_optimizer.step()
+
+                            # ACTOR training
+                            _, log_pi, action_probs = actor.get_action(data.observations)
+                            with torch.no_grad():
+                                qf1_values = qf1(data.observations)
+                                qf2_values = qf2(data.observations)
+                                min_qf_values = torch.min(qf1_values, qf2_values)
+                            # no need for reparameterization, the expectation can be calculated for discrete actions
+                            actor_loss = (action_probs * ((alpha * log_pi) - min_qf_values)).mean()
+
+                            actor_optimizer.zero_grad()
+                            actor_loss.backward()
+                            actor_optimizer.step()
+
+                            if args.autotune:
+                                # re-use action probabilities for temperature loss
+                                alpha_loss = (action_probs.detach() * (-log_alpha.exp() * (log_pi + target_entropy).detach())).mean()
+
+                                a_optimizer.zero_grad()
+                                alpha_loss.backward()
+                                a_optimizer.step()
+                                alpha = log_alpha.exp().item()
+
+                        # update the target networks
+                        if global_step % args.target_network_frequency == 0:
+                            for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                            for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                        
+                        # evaluate current policy
+                        if global_step % args.eval_frequency == 0:
+                            avg_return = np.mean(expected_return(actor, env_fn, device, gamma=args.gamma))
+                            episode_returns.append(avg_return)
+                            steps.append(step_count)
+                            step_count += args.eval_frequency
+                            log_string = f"seed {seed}/cp {cp}/agent_type preferences/step {step_count}"
+                            if eval_flag:
+                                evaluate_in_process("SAC", actor, run_name, torch.device("cpu"), args, log_string)
+                            if args.save_model_weights_at_eval and seed == 0 and d == args.D - 1 and args.total_timesteps - global_step <= args.eval_frequency * 4:
+                                save_actor_model_weights(actor, qf1, qf2, qf1_target, qf2_target, directory=f"models/{run_name}/{log_string}", step=global_step)
+                            print(f"Step: {global_step} | Expected Return: {avg_return}")
+            
+            envs.close()
+            # episode_returns_all.append(episode_returns)
+            if seed_idx == 0:
+                if cp_idx == 0:
+                    steps_preference = steps.copy()
+                label = r'$\epsilon$ = ' + str(cp/100)
+                labels.append(label)
+            # plt.plot(steps, episode_returns, label=label)
+            results_preference[cp_idx].append(episode_returns)
+
+    plt.figure()
+    mean_base = np.mean(np.array(results_base), axis=0)
+    std_base = np.std(np.array(results_base), axis=0)
+
+    # truncate to same size as preferneces
+    steps_base = steps_base[:len(steps_preference)]
+    mean_base = mean_base[:len(steps_preference)]
+    std_base = std_base[:len(steps_preference)]
+    plt.plot(steps_base, mean_base, label='SAC with task reward', linestyle='--')
+    plt.fill_between(steps_base, mean_base - std_base, mean_base + std_base, alpha=0.15)
+
+    for result_idx, result in enumerate(results_preference):
+        mean_preference = np.mean(np.array(result), axis=0)
+        std_preference = np.std(np.array(result), axis=0)
+        plt.plot(steps_preference, mean_preference, label=labels[result_idx])
+        plt.fill_between(steps_preference, mean_preference - std_preference, mean_preference + std_preference, alpha=0.15)
+
+    plt.xlim(left=0)
+    if args.env_id == 'InvertedPendulum-v4':
+        plt.ylim(bottom=0)
+    plt.grid(True, color='gray', alpha=0.3)
+    plt.xlabel('Timesteps')
+    plt.ylabel('Episode Return')
+    plt.legend()
+    plt.title(f'SAC on preference data with errors, in {args.env_id}')
+    plt.savefig(f"runs/{run_name}/expected_return_comparison_{args.env_id}.png")
+    plt.show()
+
+    writer.close()
+
+
