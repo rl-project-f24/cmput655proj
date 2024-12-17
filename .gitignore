@@ -1,6 +1,12 @@
+# User added
+project/videos
+models/
+project/saved_weight_evaluation/videos/
+
 slurm
 .aim
 runs
+summary_data
 balance_bot.xml
 cleanrl/ppo_continuous_action_isaacgym/isaacgym/examples
 cleanrl/ppo_continuous_action_isaacgym/isaacgym/isaacgym

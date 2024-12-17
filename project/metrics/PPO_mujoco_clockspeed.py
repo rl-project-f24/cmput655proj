@@ -18,12 +18,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.categorical import Categorical
 import matplotlib.pyplot as plt
-
-from project.saved_weight_evaluation.ppo_save_load_weights import save_model_weights
+import wandb
 
 np.float_ = np.float64
 
-from project.evaluate_result import evaluate_result
+from evaluate_result import evaluate_result
+from collections import deque
 
 import multiprocessing
 from functools import partial
@@ -33,6 +33,41 @@ import cProfile
 import pstats
 import io
 
+
+
+def monitor_iterations(counter, interval=10, window_size=10):
+    """Continuously logs iterations per second, running average, and last 10-second average."""
+    last_count = 0
+    total_elapsed_time = 0  # Keep track of total elapsed time
+    iteration_history = deque(maxlen=window_size)  # Store iteration counts for the last `window_size` seconds
+
+    while True:
+        time.sleep(interval)  # Wait for the specified interval
+        current_count = counter["value"]
+        iterations_per_second = (current_count - last_count) / interval
+        last_count = current_count
+
+        # Update total elapsed time
+        total_elapsed_time += interval
+
+        # Update rolling history
+        iteration_history.append(iterations_per_second)
+
+        # Calculate 10-second average
+        if len(iteration_history) > 0:
+            last_10_second_average = sum(iteration_history) / len(iteration_history)
+        else:
+            last_10_second_average = 0
+
+        # Calculate running average iterations per second
+        running_average = current_count / total_elapsed_time
+
+        print(
+            f"Iterations per second (instantaneous): {iterations_per_second:.2f}, "
+            f"Running average: {running_average:.2f}, "
+            f"Last {window_size}-second average: {last_10_second_average:.2f}, "
+            f"{total_elapsed_time} seconds have elapsed"
+        )
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -47,6 +82,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
+    use_wandb: bool = False
+    """whether to use wandb or not"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
@@ -69,7 +106,7 @@ class Args:
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 1e-5
+    learning_rate: float = 3e-5
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -101,9 +138,9 @@ class Args:
     """the target KL divergence threshold"""
 
     # Reward predictor specific arguments
-    reward_learning_rate: float = 3e-5
+    reward_learning_rate: float = 1e-4
     """learning rate for the reward predictor"""
-    num_trajectories: int = 250
+    num_trajectories: int = 100
     """number of trajectories to collect for reward predictor training"""
     # num_preferences: int = 1000
     # """number of preference comparisons to generate"""
@@ -132,9 +169,7 @@ class Args:
     """Whether to run the profiler and save to local dir after completion"""
     device: str = "" 
     """Device to be used for training"""
-    save_model_weights_at_eval: bool = False
-    """Whether to save the model weights to disk at every evaluation step"""
-    
+
 
 
 
@@ -323,7 +358,7 @@ class TrajectoryCollector:
         self.device = device
         self.use_random_policy = use_random_policy
 
-    def collect_trajectory(self):
+    def collect_trajectory(self, counter=None):
         # collect 2 trajectories with the same start
         env = self.env_fn()
         states0, states1 = [], []
@@ -347,6 +382,7 @@ class TrajectoryCollector:
                 action = action.cpu().numpy()[0]
             actions0.append(action)
             obs, reward, terminated, truncated, _ = env.step(action)
+            counter["value"] += 1
             states0.append(obs)
             total_reward0 += reward
             if terminated or truncated:
@@ -370,6 +406,7 @@ class TrajectoryCollector:
                 action = action.cpu().numpy()[0]
             actions1.append(action)
             obs, reward, terminated, truncated, _ = env.step(action)
+            counter["value"] += 1
             states1.append(obs)
             total_reward1 += reward
             if terminated or truncated:
@@ -380,11 +417,11 @@ class TrajectoryCollector:
         env.close()
         return np.array(states0), total_reward0, np.array(actions0), np.array(states1), total_reward1, np.array(actions1)
 
-    def collect_trajectories(self, n_trajectories):
+    def collect_trajectories(self, n_trajectories, counter=None):
         trajectories0 = {}
         trajectories1 = {}
         for i in range(n_trajectories):
-            states0, reward0, actions0, states1, reward1, actions1 = self.collect_trajectory()
+            states0, reward0, actions0, states1, reward1, actions1 = self.collect_trajectory(counter=counter)
             trajectories0[i] = (states0, actions0, reward0)
             trajectories1[i] = (states1, actions1, reward1)
         return trajectories0, trajectories1
@@ -427,13 +464,12 @@ class RewardTrainer:
 
         return preferences
 
-    def train_on_dataloader(self, train_dataloader, val_dataloader=None, n_epochs=1):
-        best_val_accuracy = 0.0
+    def train_on_dataloader(self, dataloader, n_epochs=1, counter=None):
+        reward_accuracy = 0
         for epoch in range(n_epochs):
-            self.predictor.train()
             epoch_losses = []
             epoch_accuracies = []
-            for s1, a1, s2, a2, prefs in train_dataloader:
+            for s1, a1, s2, a2, prefs in dataloader:
                 s1 = s1.to(self.device)
                 s2 = s2.to(self.device)
                 a1 = a1.to(self.device)
@@ -458,6 +494,7 @@ class RewardTrainer:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                counter["value"] += 1 # good
 
                 # Calculate accuracy
                 with torch.no_grad():
@@ -469,43 +506,14 @@ class RewardTrainer:
                 epoch_accuracies.append(accuracy.item())
 
             avg_loss = np.mean(epoch_losses)
-            avg_train_accuracy = np.mean(epoch_accuracies)
-            if val_dataloader is not None:
-                self.predictor.eval()
-                val_accuracies = []
-                with torch.no_grad():
-                    for s1, a1, s2, a2, prefs in val_dataloader:
-                        s1 = s1.to(self.device)
-                        s2 = s2.to(self.device)
-                        a1 = a1.to(self.device)
-                        a2 = a2.to(self.device)
-                        prefs = prefs.to(self.device)
-
-                        r1 = self.predictor(s1, a1).squeeze(-1)
-                        r2 = self.predictor(s2, a2).squeeze(-1)
-                        r1_sum = r1.sum(dim=1)
-                        r2_sum = r2.sum(dim=1)
-                        logits = torch.stack([r1_sum, r2_sum], dim=1)
-                        
-                        predictions = logits.argmax(dim=1)
-                        targets = prefs.argmax(dim=1)
-                        accuracy = (predictions == targets).float().mean().item()
-                        val_accuracies.append(accuracy)
-
-                avg_val_accuracy = np.mean(val_accuracies)
-                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}, Val Acc: {avg_val_accuracy:.4f}")
-                if avg_val_accuracy > best_val_accuracy:
-                    best_val_accuracy = avg_val_accuracy
-            else:
-                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Train Acc: {avg_train_accuracy:.4f}")
+            avg_accuracy = np.mean(epoch_accuracies)
             # if epoch == n_epochs-1:
-            #     # print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            #     print(f"Reward Predictor Training - Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
             #     reward_accuracy = avg_accuracy
-        # return reward_accuracy
-        return best_val_accuracy if val_dataloader is not None else avg_train_accuracy
+        return reward_accuracy
 
 
-def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99):
+def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99, counter=None):
     returns = []
     for _ in range(num_episodes):
         env = env_fn()
@@ -519,6 +527,7 @@ def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99):
                 action, _, _, _ = agent.get_action_and_value(obs_tensor)
             action = action.cpu().numpy()[0]
             obs, reward, terminated, truncated, _ = env.step(action)
+            counter["value"] += 1 # good
             total_return += reward
             # discount *= gamma
             done = terminated or truncated
@@ -530,7 +539,7 @@ def expected_return(agent, env_fn, device, seed, num_episodes=20, gamma=0.99):
 def smooth(data, span):
     return np.convolve(data, np.ones(span) / span, mode='valid')
 
-def run_subprocess(seed, run_name, args):
+def run_subprocess(seed, run_name, args, counter):
     eval_flag = args.run_evaluation and seed == evaluation_seed # only evaluate if the seed is the evaluation one
     start_time = time.time()
     # print(f"SEED: {seed} STARTING!!!!!")
@@ -542,7 +551,7 @@ def run_subprocess(seed, run_name, args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     if args.device != "":
         device = torch.device(args.device)
-    logger.info(f"Using device {device}")
+    # logger.info(f"Using device {device}")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
@@ -609,58 +618,81 @@ def run_subprocess(seed, run_name, args):
         next_done = torch.zeros(args.num_envs).to(device)
 
         # for d in range(args.D):
-        outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
-        for d in outer_loop_bar:
-            outer_loop_bar.set_postfix({"Iteration": d + 1})
+        
+        # for d in range(args.D):
             # print(f"Seed: {seed} | Outer iteration {d+1}/{args.D}")
+        if cp == 0:
 
-            # Collect trajectories
-            use_random_policy = (d == 0)  # Use random policy in the first iteration
-            collector = TrajectoryCollector(
-                lambda: env_fn(),
-                agent=agent_predicted if not use_random_policy else None,
-                num_steps=segment_length,
-                device=device,
-                use_random_policy=use_random_policy,
-            )
-            trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories)
-            segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
-            segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
+            # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
+            # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
+            # agents  = [('Actual', agent_actual, optimizer_actual)]
+            agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
+        else:
+            agents = [('Predicted', agent_predicted, optimizer_predicted)]
 
-            # Generate preferences
-            preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
+            
+        global_step = 0
 
-            # Create dataset and dataloader
-            dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
-            train_size = int(0.8 * len(dataset))
-            val_size = len(dataset) - train_size
-            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+        agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
+        for agent_type, agent_instance, optimizer_instance in agent_bar:
+            agent_bar.set_postfix({"Agent Type": agent_type})
 
-            train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-            val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-            # Train reward predictor
-            # print(f"Seed: {seed} | Training the Reward Predictor...")
-            reward_accuracy = reward_trainer.train_on_dataloader(train_dataloader, val_dataloader, n_epochs=args.reward_training_epochs)
-            reward_accuracy_this_cp.append(reward_accuracy)
+            global_step = 0
+            if args.use_wandb:
+                assert wandb.run is None
+                run = wandb.init(
+                    # set the wandb project where this run will be logged
+                    project="PPO_mujooco_clockspeed",
+                    group=args.exp_name,  # Group all seeds under the same experiment name
+                    # track hyperparameters and run metadata
+                    config={
+                    "architecture": "PPO_discrete",
+                    "run_id": int(time.time()),
+                    "env_id": args.env_id,
+                    "corruption_percent": cp,
+                    "agent_type": agent_type,
+                    "batch_size": args.batch_size,
+                    "D / Reward training steps": args.D,
+                    "total-timesteps_per_iteration": args.total_timesteps_per_iteration,
+                    "run_name": run_name,
+                    "seed": seed,
+                    },
+                    reinit=True  # Allows reinitialization in the same process
+                )
+            # print(run.resumed)
+            outer_loop_bar = tqdm(range(args.D), desc=f"Seed {seed} Reward Trainer Version (Outer Loop)", unit="iteration", leave=False, position=2)
+            for d in outer_loop_bar:
+                outer_loop_bar.set_postfix({"Iteration": d + 1})
 
-            # agent_end_of_d_minus_one = copy.deepcopy(agent)
-            # agent_predicted = agent_end_of_d_minus_one
-            # optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
-            # if d == args.D - 1:
-            if cp == 0:
 
-                # agent_actual = copy.deepcopy(agent_end_of_d_minus_one)
-                # optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
-                # agents  = [('Actual', agent_actual, optimizer_actual)]
-                agents  = [('Actual', agent_actual, optimizer_actual), ('Predicted', agent_predicted, optimizer_predicted)]
-            else:
-                agents = [('Predicted', agent_predicted, optimizer_predicted)]
-                global_step = 0
+                # Collect trajectories
+                use_random_policy = (d == 0)  # Use random policy in the first iteration
+                collector = TrajectoryCollector(
+                    lambda: env_fn(),
+                    agent=agent_predicted if not use_random_policy else None,
+                    num_steps=segment_length,
+                    device=device,
+                    use_random_policy=use_random_policy,
+                )
+                trajectories0, trajectories1 = collector.collect_trajectories(args.num_trajectories, counter=counter)
+                segments0 = {k: [v[0], v[1]] for k, v in trajectories0.items()}  # Only store states and actions
+                segments1 = {k: [v[0], v[1]] for k, v in trajectories1.items()}  # Only store states and actions
 
-            agent_bar =  tqdm(agents, desc="Training Actual/Predicted Agent", unit="agent", leave=False, total=len(agents))
-            for agent_type, agent_instance, optimizer_instance in agent_bar:
-                agent_bar.set_postfix({"Agent Type": agent_type})
-                # print(f"Seed: {seed} | Training agent on {agent_type} rewards")
+                # Generate preferences
+                preferences = reward_trainer.generate_preferences(trajectories0, trajectories1, args.num_trajectories)
+
+                # Create dataset and dataloader
+                dataset = PreferenceDataset(segments0, segments1, preferences, segment_length)
+                dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+                # Train reward predictor
+                # print(f"Seed: {seed} | Training the Reward Predictor...")
+                reward_accuracy = reward_trainer.train_on_dataloader(dataloader, n_epochs=args.reward_training_epochs, counter=counter)
+                reward_accuracy_this_cp.append(reward_accuracy)
+
+                # agent_end_of_d_minus_one = copy.deepcopy(agent)
+                # agent_predicted = agent_end_of_d_minus_one
+                # optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
+                # if d == args.D - 1:
 
                 # Initialize PPO storage variables
                 obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -718,6 +750,7 @@ def run_subprocess(seed, run_name, args):
                         # TRY NOT TO MODIFY: execute the game and log data.
                         prev_obs = next_obs
                         next_obs_np, actual_reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                        counter["value"] += 1 # good
                         next_obs = torch.Tensor(next_obs_np).to(device)
                         next_done = torch.Tensor(np.logical_or(terminations, truncations)).to(device)
                         actual_reward = torch.tensor(actual_reward).to(device).view(-1)
@@ -804,7 +837,7 @@ def run_subprocess(seed, run_name, args):
                             loss.backward()
                             nn.utils.clip_grad_norm_(agent_instance.parameters(), args.max_grad_norm)
                             optimizer_instance.step()
-
+                            counter["value"] += 1 # good
                         if args.target_kl is not None and approx_kl > args.target_kl:
                             break
 
@@ -812,19 +845,38 @@ def run_subprocess(seed, run_name, args):
                     var_y = np.var(y_true)
                     explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma))
+                    avg_return = np.mean(expected_return(agent_instance, env_fn, device, seed, gamma=args.gamma, counter=counter))
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
+                    if args.use_wandb:
+                        wandb.log({
+                            "corruption_percentage": cp,
+                            "agent_type": agent_type,
+                            "iteration": iteration,
+                            "ppo_loss": loss.item(),
+                            "policy_gradient_loss": pg_loss.item(),
+                            "value_function_loss": v_loss.item(),
+                            "entropy_loss": entropy_loss.item(),
+                            "clip_fraction": np.mean(clipfracs),
+                            "approx_kl": approx_kl.item(),
+                            "learning_rate": optimizer_instance.param_groups[0]["lr"],
+                            "expected_return": avg_return,
+                        }, step=global_step)
+                    # print(f"LOGGING STEP {global_step}")
                     # if iteration % 10 == 0:
                     #     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
-                    if args.save_model_weights_at_eval:
-                        save_model_weights(agent_instance, directory=f"models/{run_name}/{log_string}", step=global_step)
-
-
+                    # Force refresh to fix blank lines
+                    # corruption_bar.refresh()
+                    # outer_loop_bar.refresh()
+                    # agent_bar.refresh()
+                    # ppo_bar.refresh()
+                        # Finish the current run
+            if args.use_wandb:
+                wandb.finish()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
@@ -859,7 +911,7 @@ if __name__ == "__main__":
     args.total_timesteps = args.total_timesteps_per_iteration * args.D
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations_per_outer_loop = args.total_timesteps_per_iteration // args.batch_size
+    args.num_iterations_per_outer_loop = args.total_timesteps_per_iteration // args.batch_size or 1
     run_name = f"{args.env_id}__{args.exp_name}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 
@@ -872,6 +924,15 @@ if __name__ == "__main__":
     steps_all = {}
     reward_accuracy_all = []
     # agents_eval = {}
+
+    # Use a Manager to create shared state
+    manager = multiprocessing.Manager()
+    counter = manager.dict()
+    counter["value"] = 0  # Initialize the shared counter
+
+    # Launch the monitoring thread
+    monitor_thread = threading.Thread(target=monitor_iterations, args=(counter,), daemon=True)
+    monitor_thread.start()
 
 
     profiler = None
@@ -897,6 +958,7 @@ if __name__ == "__main__":
             run_subprocess,
             run_name=run_name,
             args=args,
+            counter=counter  # Pass the managed shared counter
         )
 
         with tqdm(total=len(seeds), desc="Running seeds", position=0) as seed_bar:
@@ -908,7 +970,7 @@ if __name__ == "__main__":
         logger.info(f"Running sequentially with {num_seeds} seeds")
         with tqdm(seeds, desc="Seeds", unit="seed", position=0) as seed_bar:
             for seed in seed_bar:
-                result = run_subprocess(seed, run_name, args)
+                result = run_subprocess(seed, run_name, args, counter)
                 results.append(result)
 
     # ! PROFILER HERE

@@ -59,17 +59,13 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the id of the environment"""
-    reward_min: int = -10
-    """the min clip of environment reward funciton"""
-    reward_max: int = 10
-    """the max clip of environment reward funciton"""
     num_seeds: int = 1
     """number of seeds to run everythhing"""
     total_timesteps_per_iteration: int = 10000
     """total timesteps per outer loop iteration"""
     D: int = 5
     """number of outer loop iterations"""
-    learning_rate: float = 1e-5
+    learning_rate: float = 3e-5
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -101,11 +97,11 @@ class Args:
     """the target KL divergence threshold"""
 
     # Reward predictor specific arguments
-    reward_learning_rate: float = 3e-5
+    reward_learning_rate: float = 1e-4
     """learning rate for the reward predictor"""
-    num_trajectories: int = 250
+    num_trajectories: int = 125
     """number of trajectories to collect for reward predictor training"""
-    # num_preferences: int = 1000
+    # num_preferences: int = 300
     # """number of preference comparisons to generate"""
     reward_training_epochs: int = 9
     """number of epochs to train the reward predictor"""
@@ -134,7 +130,6 @@ class Args:
     """Device to be used for training"""
     save_model_weights_at_eval: bool = False
     """Whether to save the model weights to disk at every evaluation step"""
-    
 
 
 
@@ -151,21 +146,14 @@ def step_trigger(step_number):
     # return step_number % 1000 == 0  # Record every 1000 steps   
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma, reward_min, reward_max):
+def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=episode_trigger)
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, reward_min, reward_max))
         return env
 
     return thunk
@@ -176,7 +164,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class Agent(nn.Module):
+class AgentDiscrete(nn.Module):
     def __init__(self, envs):
         super().__init__()
         hidden_size = 128
@@ -185,33 +173,30 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(hidden_size, 1), std=0.1),
+            layer_init(nn.Linear(hidden_size, 1), std=1.0),
         )
-        self.actor_mean = nn.Sequential(
+        self.actor = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), hidden_size)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.Tanh(),
-            layer_init(nn.Linear(hidden_size, np.prod(envs.single_action_space.shape)), std=0.01),
+            layer_init(nn.Linear(hidden_size, envs.single_action_space.n), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        logits = self.actor(x)
+        probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
 
 # Reward Predictor Network
 class RewardPredictorNetwork(nn.Module):
-    def __init__(self, observation_space, action_space, reward_min, reward_max):
+    def __init__(self, observation_space, action_space, env_id):
         super().__init__()
         if isinstance(action_space, gym.spaces.Discrete):
             action_dim = action_space.n # one-hot encoded action
@@ -229,9 +214,8 @@ class RewardPredictorNetwork(nn.Module):
             layer_init(nn.Linear(hidden_size, 1)),
         )
         self.sigmoid = nn.Sigmoid()
+        self.env_id = env_id
         self.action_space = action_space
-        self.reward_min = reward_min
-        self.reward_max = reward_max
 
     def forward(self, x, actions):
         # x shape: [batch_size, sequence_length, observation_dim]
@@ -252,11 +236,13 @@ class RewardPredictorNetwork(nn.Module):
         x = torch.cat([x, actions_one_hot], dim=-1)  # Concatenate on the last dimension
         x = x.view(-1, obs_dim + action_dim)  # Flatten to [batch_size * sequence_length, obs_dim + action_dim]
         outputs_original = self.network(x)  # [batch_size * sequence_length, 1]
-        # outputs = self.network(x)  # [batch_size * sequence_length, 1]
-        outputs = self.sigmoid(outputs_original)  # Apply sigmoid
+        # outputs = outputs_original
         
-        # scale the outputs to the desired reward range
-        outputs = outputs * (self.reward_max - self.reward_min) + self.reward_min
+        
+        if self.env_id == "Acrobot-v1":
+            outputs = -self.sigmoid(outputs_original)
+        else:
+            outputs = self.sigmoid(outputs_original)
 
         outputs = outputs.view(batch_size, sequence_length, -1)  # Reshape back
         return outputs  # Shape: [batch_size, sequence_length, 1]
@@ -470,6 +456,7 @@ class RewardTrainer:
 
             avg_loss = np.mean(epoch_losses)
             avg_train_accuracy = np.mean(epoch_accuracies)
+
             if val_dataloader is not None:
                 self.predictor.eval()
                 val_accuracies = []
@@ -542,23 +529,17 @@ def run_subprocess(seed, run_name, args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     if args.device != "":
         device = torch.device(args.device)
-    logger.info(f"Using device {device}")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, args.reward_min, args.reward_max) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
-    env_fn = lambda capture_video=args.capture_video: make_env(args.env_id, 0, capture_video, run_name, args.gamma, args.reward_min, args.reward_max)()
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    env_fn = lambda: make_env(args.env_id, 0, args.capture_video, run_name)()
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     expected_returns_this = {}
     steps_this = {}
     reward_accuracy_this = []
-
-    # # Initialize step counters and expected return histories for agents
-    # step_counter = {'Predicted': 0, 'Actual': 0}
-    # expected_returns = {'Predicted': [], 'Actual': []}
-    # steps = {'Predicted': [], 'Actual': []}
 
     segment_length = 50  # or any fixed length you prefer
 
@@ -574,7 +555,7 @@ def run_subprocess(seed, run_name, args):
         args.corruption_percentage = cp
 
         # Initialize Reward Predictor and Trainer
-        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space, args.reward_min, args.reward_max)
+        reward_predictor = RewardPredictorNetwork(envs.single_observation_space, envs.single_action_space, args.env_id)
         reward_trainer = RewardTrainer(
             reward_predictor,
             device=device,
@@ -583,11 +564,11 @@ def run_subprocess(seed, run_name, args):
         )
 
         # Initialize Agent and Optimizer
-        agent_predicted = Agent(envs).to(device)
+        agent_predicted = AgentDiscrete(envs).to(device)
         optimizer_predicted = optim.Adam(agent_predicted.parameters(), lr=args.learning_rate, eps=1e-5)
 
         if cp == 0:
-            agent_actual = Agent(envs).to(device)
+            agent_actual = AgentDiscrete(envs).to(device)
             optimizer_actual = optim.Adam(agent_actual.parameters(), lr=args.learning_rate, eps=1e-5)
 
         # Global step and start time
@@ -617,7 +598,7 @@ def run_subprocess(seed, run_name, args):
             # Collect trajectories
             use_random_policy = (d == 0)  # Use random policy in the first iteration
             collector = TrajectoryCollector(
-                lambda: env_fn(),
+                env_fn,
                 agent=agent_predicted if not use_random_policy else None,
                 num_steps=segment_length,
                 device=device,
@@ -763,7 +744,7 @@ def run_subprocess(seed, run_name, args):
                             end = start + args.minibatch_size
                             mb_inds = b_inds[start:end]
 
-                            _, newlogprob, entropy, newvalue = agent_instance.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                            _, newlogprob, entropy, newvalue = agent_instance.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                             logratio = newlogprob - b_logprobs[mb_inds]
                             ratio = logratio.exp()
 
@@ -816,15 +797,18 @@ def run_subprocess(seed, run_name, args):
                     expected_returns[agent_type].append(avg_return)
                     steps[agent_type].append(step_counter[agent_type])
                     # if iteration % 10 == 0:
-                    #     print(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
+                    #     logger.info(f"Seed: {seed} | Iteration {iteration}/{args.num_iterations_per_outer_loop} | {agent_type} | cp={cp}% | Expected Return: {avg_return}")
                     log_string = f"seed {seed}/cp {cp}/agent_type {agent_type}/step {step_counter[agent_type]}, PPO training iteration {iteration}"
                     if eval_flag:
                         if iteration == args.num_iterations_per_outer_loop:
                             evaluate_result(agent_type, agent_instance, run_name, device, args, log_string)
                     if args.save_model_weights_at_eval:
                         save_model_weights(agent_instance, directory=f"models/{run_name}/{log_string}", step=global_step)
-
-
+                    # Force refresh to fix blank lines
+                    # corruption_bar.refresh()
+                    # outer_loop_bar.refresh()
+                    # agent_bar.refresh()
+                    # ppo_bar.refresh()
         
         # Store results for plotting
         reward_accuracy_this.append(reward_accuracy_this_cp)
@@ -846,7 +830,6 @@ def run_subprocess(seed, run_name, args):
 
 if __name__ == "__main__":
 
-
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sibling_folder = os.path.join(current_dir, '..', 'summary_data')
     if not os.path.exists(sibling_folder):
@@ -862,10 +845,6 @@ if __name__ == "__main__":
     args.num_iterations_per_outer_loop = args.total_timesteps_per_iteration // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
-
-    if args.env_id == "InvertedPendulum-v4":
-        args.reward_min = 0
-        args.reward_max = 1
 
     # Initialize dictionaries to store results
     expected_returns_all = {}
@@ -962,6 +941,7 @@ if __name__ == "__main__":
     mean_values = np.mean(data_stack, axis=0)
     std_values = np.std(data_stack, axis=0)
     file.write(f"{baseline_key}\t{mean_values[-1]:.3f}\t{std_values[-1]:.3f}\n")
+    # plot baseline: actual 0%
     plt.plot(steps_all['Predicted cp=0%'], mean_values, label=custom_labels[baseline_key], linestyle='--')
     plt.fill_between(steps_all['Predicted cp=0%'], mean_values - std_values, mean_values + std_values, alpha=0.15)
 
@@ -977,8 +957,10 @@ if __name__ == "__main__":
     file.close()
     
     plt.xlim(left=0, right=args.total_timesteps_per_iteration*args.D)
-    if args.env_id == 'InvertedPendulum-v4':
-        plt.ylim(bottom=0, top=1000)
+    if args.env_id == 'CartPole-v1':
+        plt.ylim(bottom=0, top=500)
+    if args.env_id == 'Acrobot-v1':
+        plt.ylim(bottom=-500, top=0)
     plt.grid(True, color='gray', alpha=0.3)
     plt.xlabel('Timesteps')
     plt.ylabel('Episode Return')
